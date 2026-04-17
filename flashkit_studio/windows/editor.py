@@ -35,6 +35,7 @@ from .. import actions
 from ..highlighter import As3Highlighter
 from ..state import StudioState, ClassEntry
 from ..theme import Palette, Scale, code_font
+from .bottom_panel import BottomPanel
 
 
 _VIEWS = [
@@ -98,6 +99,8 @@ class Editor(QWidget):
         self.mid_split.addWidget(self.tabs)
 
         self.outline = _Outline(state)
+        self.outline.findReferencesRequested.connect(self._show_references)
+        self.outline.showHierarchyRequested.connect(self._show_hierarchy)
         self.mid_split.addWidget(self.outline)
         self.mid_split.setStretchFactor(0, 1)
         self.mid_split.setStretchFactor(1, 0)
@@ -106,7 +109,15 @@ class Editor(QWidget):
         # Bottom view bar.
         self.view_bar = _ViewBar()
         self.view_bar.viewChanged.connect(self._on_view_changed)
+        self.view_bar.filterChanged.connect(state.set_pool_filter)
         page_layout.addWidget(self.view_bar)
+
+        # Bottom docked panel (references / hierarchy / bookmarks / assets).
+        # Hidden by default — pops open when the user invokes a feature
+        # that uses it (Find References, Show Hierarchy, etc).
+        self.bottom = BottomPanel(state)
+        self.bottom.setVisible(False)
+        page_layout.addWidget(self.bottom)
 
         self.stack.addWidget(page)
 
@@ -116,6 +127,7 @@ class Editor(QWidget):
         state.active_resource_changed.connect(self._rebuild)
         state.tabs_changed.connect(self._rebuild)
         state.view_changed.connect(self._on_state_view_changed)
+        state.pool_filter_changed.connect(self._refresh_current_text)
         state.jump_requested.connect(self._on_jump_requested)
 
         self._rebuild()
@@ -244,6 +256,22 @@ class Editor(QWidget):
         self.view_bar.set_active(self.state.active_view)
         self._refresh_current_text()
 
+    def _show_references(self, full_name: str, member: str, kind: str) -> None:
+        """Populate the bottom panel's References tab and pop it open."""
+        rows = actions.references_to_member(
+            self.state, full_name, member, kind,
+        )
+        short = full_name.rpartition(".")[2] or full_name
+        title = (f"{len(rows)} references to {short}.{member}"
+                 if rows else f"No references to {short}.{member}")
+        self.bottom.refs_tab.set_results(title, rows)
+        self.bottom.show_tab("references")
+
+    def _show_hierarchy(self, full_name: str) -> None:
+        rows = actions.class_hierarchy(self.state, full_name)
+        self.bottom.hier_tab.set_results(full_name, rows)
+        self.bottom.show_tab("hierarchy")
+
     def _on_jump_requested(self, full_name: str, member: str, line: int) -> None:
         """Called by the symbol palette, Find-in-Files, Go-to-Line, and
         jump-to-definition. Makes sure we're on source view, then
@@ -350,6 +378,7 @@ class _CloseButton(QAbstractButton):
 
 class _ViewBar(QFrame):
     viewChanged = Signal(str)
+    filterChanged = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -373,9 +402,31 @@ class _ViewBar(QFrame):
 
         layout.addStretch(1)
 
+        # Filter input shown only on pool views (strings / multinames).
+        # Sits on the right of the view bar to reuse the existing row
+        # rather than adding a dedicated header strip.
+        self._filter = QLineEdit(self)
+        self._filter.setPlaceholderText("Filter…")
+        self._filter.setFixedWidth(220)
+        self._filter.setFixedHeight(24)
+        self._filter.setClearButtonEnabled(True)
+        self._filter.textChanged.connect(self.filterChanged.emit)
+        self._filter.setVisible(False)
+        layout.addWidget(self._filter)
+
     def set_active(self, key: str) -> None:
         for k, btn in self._buttons.items():
             btn.setChecked(k == key)
+        self._filter.setVisible(key in ("strings", "multinames"))
+
+    def filter_text(self) -> str:
+        return self._filter.text()
+
+    def set_filter(self, text: str) -> None:
+        if self._filter.text() != text:
+            self._filter.blockSignals(True)
+            self._filter.setText(text)
+            self._filter.blockSignals(False)
 
     def _on_click(self, key: str) -> None:
         self.set_active(key)
@@ -431,6 +482,23 @@ class _CodeView(QWidget):
         sc_def = QShortcut(QKeySequence("F12"), self)
         sc_def.setContext(Qt.WidgetWithChildrenShortcut)
         sc_def.activated.connect(self._jump_to_cursor_word)
+
+        # Ctrl+B — toggle a bookmark on the current line.
+        sc_bm = QShortcut(QKeySequence("Ctrl+B"), self)
+        sc_bm.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_bm.activated.connect(self._toggle_bookmark)
+
+    # ── bookmarks ────────────────────────────────────────────────
+
+    def _toggle_bookmark(self) -> None:
+        r = self._state.active_resource()
+        if r is None or not r.active_class_full_name:
+            return
+        line = self._editor.textCursor().blockNumber() + 1
+        now_set = r.toggle_bookmark(r.active_class_full_name, line)
+        self._state.tabs_changed.emit()  # refreshes Bookmarks tab
+        verb = "Bookmarked" if now_set else "Cleared bookmark on"
+        self._state.set_status(f"{verb} line {line}")
 
     # ── jump-to-definition ────────────────────────────────────────
 
@@ -928,12 +996,19 @@ class _Outline(QFrame):
     """Right-side list of fields + methods for the active class.
 
     Updated whenever ``tabs_changed`` or ``active_resource_changed``
-    fires. Clicking a row jumps the code view to the member.
+    fires. Clicking a row jumps the code view to the member; right-click
+    gives Find References / Show Hierarchy.
     """
 
     _KIND_GLYPH = {
         "field": "⬥", "method": "ƒ", "getter": "›", "setter": "‹",
     }
+
+    # Emitted with (class_full_name, member_name, kind)
+    #   kind is "method" or "field".
+    findReferencesRequested = Signal(str, str, str)
+    # Emitted with class_full_name.
+    showHierarchyRequested = Signal(str)
 
     def __init__(self, state: StudioState,
                  parent: QWidget | None = None) -> None:
@@ -988,6 +1063,8 @@ class _Outline(QFrame):
         self._list.setUniformItemSizes(True)
         self._list.itemActivated.connect(self._on_activate)
         self._list.itemClicked.connect(self._on_activate)
+        self._list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._ctx_menu)
         layout.addWidget(self._list, 1)
 
     def set_for(self, resource, full_name: str | None) -> None:
@@ -1001,14 +1078,38 @@ class _Outline(QFrame):
             static = " static" if m.is_static else ""
             label = f"{glyph}  {m.name}  : {m.type_name}{static}"
             item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, m.name)
+            # Store (member_name, kind) so context menu can dispatch on kind.
+            kind = "field" if m.kind == "field" else "method"
+            item.setData(Qt.UserRole, (m.name, kind))
             self._list.addItem(item)
 
     def _on_activate(self, item: QListWidgetItem) -> None:
-        name = item.data(Qt.UserRole)
-        if not name or not hasattr(self, "_full_name"):
+        data = item.data(Qt.UserRole)
+        if not data or not hasattr(self, "_full_name"):
             return
+        name = data[0] if isinstance(data, tuple) else data
         self._state.jump_requested.emit(self._full_name, str(name), -1)
+
+    def _ctx_menu(self, pos) -> None:
+        item = self._list.itemAt(pos)
+        if item is None or not hasattr(self, "_full_name"):
+            return
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        name, kind = data
+        menu = QMenu(self)
+        act_jump = menu.addAction("Go to Definition")
+        act_refs = menu.addAction("Find References")
+        menu.addSeparator()
+        act_hier = menu.addAction("Show Class Hierarchy")
+        chosen = menu.exec(self._list.mapToGlobal(pos))
+        if chosen is act_jump:
+            self._state.jump_requested.emit(self._full_name, name, -1)
+        elif chosen is act_refs:
+            self.findReferencesRequested.emit(self._full_name, name, kind)
+        elif chosen is act_hier:
+            self.showHierarchyRequested.emit(self._full_name)
 
 
 # ── welcome page ─────────────────────────────────────────────────────────

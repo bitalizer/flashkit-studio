@@ -15,7 +15,7 @@ from typing import Optional
 
 from flashkit.abc.disasm import decode_instructions, resolve_instructions
 from flashkit.decompile import decompile_class, list_classes
-from flashkit.workspace.resource import load_swf, load_swz
+from flashkit.workspace.workspace import Workspace
 
 from . import settings
 from .state import ClassEntry, LoadedResource, StudioState
@@ -41,8 +41,12 @@ def open_swf(state: StudioState, path: str | Path) -> bool:
     state.set_status(f"Loading {p.name}…", busy=True)
     try:
         t0 = time.perf_counter()
-        resource = (load_swz(p) if p.suffix.lower() == ".swz"
-                    else load_swf(p))
+        # Route through Workspace so reference / inheritance / field-access
+        # indexes are available to every panel (references, hierarchy,
+        # callers) without re-scanning bytecode per query.
+        workspace = Workspace()
+        resource = (workspace.load_swz(p) if p.suffix.lower() == ".swz"
+                    else workspace.load_swf(p))
         elapsed = time.perf_counter() - t0
     except Exception as exc:  # noqa: BLE001
         log.exception("open_swf failed")
@@ -51,7 +55,7 @@ def open_swf(state: StudioState, path: str | Path) -> bool:
 
     classes = _list_classes_flat(resource.abc_blocks)
     state.add_resource(LoadedResource(
-        path=p, resource=resource, classes=classes,
+        path=p, resource=resource, workspace=workspace, classes=classes,
     ))
     settings.push_recent_swf(p)
     state.recent_changed.emit()
@@ -92,7 +96,13 @@ def render_view(state: StudioState, view_key: str) -> str:
     if r is None or cls is None or abc is None:
         return ""
 
-    key = (state.active_resource_index or 0, cls.full_name, view_key)
+    # For pool views (strings, multinames) the filter is part of the
+    # key so we don't return a stale unfiltered result after the user
+    # types into the filter input.
+    filter_key = (state.pool_filter
+                  if view_key in ("strings", "multinames") else "")
+    key = (state.active_resource_index or 0,
+           cls.full_name, view_key, filter_key)
     if key in _CACHE:
         return _CACHE[key]
 
@@ -106,9 +116,9 @@ def render_view(state: StudioState, view_key: str) -> str:
         elif view_key == "traits":
             text = _render_traits(abc, cls)
         elif view_key == "strings":
-            text = _render_strings(abc)
+            text = _render_strings(abc, state.pool_filter)
         elif view_key == "multinames":
-            text = _render_multinames(abc)
+            text = _render_multinames(abc, state.pool_filter)
         else:
             text = f"// unknown view: {view_key}"
     except Exception as exc:  # noqa: BLE001
@@ -164,26 +174,46 @@ def _render_disasm(abc, cls: ClassEntry) -> str:
     return "\n".join(lines)
 
 
-def _render_strings(abc) -> str:
-    lines = [f"// String pool  ({len(abc.string_pool)} entries)"]
+def _render_strings(abc, pool_filter: str = "") -> str:
+    q = pool_filter.lower()
+    matched = 0
+    lines = [""]  # header goes after counting so it can show N/total
     for i, s in enumerate(abc.string_pool):
+        if q and q not in s.lower():
+            continue
+        matched += 1
         preview = (s[:200] + "…") if len(s) > 200 else s
         preview = (preview.replace("\n", "\\n")
                    .replace("\r", "\\r")
                    .replace("\t", "\\t"))
         lines.append(f'  [{i:4d}]  "{preview}"')
+    total = len(abc.string_pool)
+    if q:
+        lines[0] = f"// String pool  ({matched} of {total} match '{pool_filter}')"
+    else:
+        lines[0] = f"// String pool  ({total} entries)"
     return "\n".join(lines)
 
 
-def _render_multinames(abc) -> str:
+def _render_multinames(abc, pool_filter: str = "") -> str:
     from flashkit.info.member_info import resolve_multiname
-    lines = [f"// Multiname pool  ({len(abc.multiname_pool)} entries)"]
+    q = pool_filter.lower()
+    matched = 0
+    lines = [""]
     for i in range(len(abc.multiname_pool)):
         try:
             name = resolve_multiname(abc, i)
         except Exception:
             name = "<error>"
+        if q and q not in name.lower():
+            continue
+        matched += 1
         lines.append(f"  [{i:4d}]  {name}")
+    total = len(abc.multiname_pool)
+    if q:
+        lines[0] = f"// Multiname pool  ({matched} of {total} match '{pool_filter}')"
+    else:
+        lines[0] = f"// Multiname pool  ({total} entries)"
     return "\n".join(lines)
 
 
@@ -375,6 +405,249 @@ class FindHit:
     class_short_name: str
     line_number: int     # 1-based
     line_text: str
+
+
+# ── references ────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RefRow:
+    """One row in the References panel."""
+    source_class: str
+    source_member: str
+    ref_kind: str
+    offset: int
+
+
+def references_to_member(state: StudioState, class_full_name: str,
+                         member: str, kind: str) -> list[RefRow]:
+    """Collect every place the given method/field is read, written, or
+    called from. ``kind`` is ``"method"`` / ``"field"`` so we pick the
+    right Workspace query."""
+    r = state.active_resource()
+    if r is None:
+        return []
+    ws = r.workspace
+    rows: list[RefRow] = []
+    if kind == "field":
+        for reader in ws.field_readers(class_full_name, member):
+            src_class, _, src_member = reader.rpartition(".")
+            rows.append(RefRow(src_class or class_full_name,
+                               src_member or reader, "field_read", -1))
+        for writer in ws.field_writers(class_full_name, member):
+            src_class, _, src_member = writer.rpartition(".")
+            rows.append(RefRow(src_class or class_full_name,
+                               src_member or writer, "field_write", -1))
+    # Also include references-to-name hits — call sites for methods and
+    # coerce/instantiation hits that touch the name.
+    for ref in ws.references_to(member):
+        rows.append(RefRow(ref.source_class, ref.source_member,
+                           ref.ref_kind, ref.offset))
+    # De-duplicate on (class, member, kind).
+    seen: set[tuple[str, str, str]] = set()
+    out: list[RefRow] = []
+    for row in rows:
+        key = (row.source_class, row.source_member, row.ref_kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    out.sort(key=lambda r_: (r_.source_class, r_.source_member))
+    return out
+
+
+def references_to_class(state: StudioState,
+                        class_full_name: str) -> list[RefRow]:
+    """Every class that mentions ``class_full_name`` — instantiations,
+    coerce-to-type, param/return types, etc."""
+    r = state.active_resource()
+    if r is None:
+        return []
+    ws = r.workspace
+    out: list[RefRow] = []
+    # Try the qualified name first, then the short name.
+    seen: set[tuple[str, str, str]] = set()
+    short = class_full_name.rpartition(".")[2]
+    for target in (class_full_name, short):
+        for ref in ws.references_to(target):
+            key = (ref.source_class, ref.source_member, ref.ref_kind)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(RefRow(ref.source_class, ref.source_member,
+                              ref.ref_kind, ref.offset))
+    out.sort(key=lambda r_: (r_.source_class, r_.source_member))
+    return out
+
+
+# ── class hierarchy ───────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class HierarchyRow:
+    """Row in the hierarchy panel — one class plus its depth from the
+    target class (0 = the class itself, negative = ancestor, positive
+    = descendant)."""
+    class_full_name: str
+    depth: int
+    relation: str     # "self" | "super" | "sub"
+
+
+def class_hierarchy(state: StudioState,
+                    class_full_name: str) -> list[HierarchyRow]:
+    r = state.active_resource()
+    if r is None:
+        return []
+    ws = r.workspace
+    rows: list[HierarchyRow] = []
+
+    # Ancestors (immediate parent first, walking up).
+    parents = ws.get_ancestors(class_full_name)
+    for i, p in enumerate(parents):
+        rows.append(HierarchyRow(p, -(i + 1), "super"))
+    rows.reverse()  # root first.
+    rows.append(HierarchyRow(class_full_name, 0, "self"))
+
+    # Descendants — BFS one level at a time.
+    frontier = ws.get_subclasses(class_full_name)
+    depth = 1
+    while frontier:
+        next_frontier: list[str] = []
+        for name in sorted(frontier):
+            rows.append(HierarchyRow(name, depth, "sub"))
+            next_frontier.extend(ws.get_subclasses(name))
+        frontier = next_frontier
+        depth += 1
+    return rows
+
+
+# ── per-method disassembly ────────────────────────────────────────────
+
+
+def render_method_disasm(state: StudioState,
+                         class_full_name: str,
+                         method_index: int) -> str:
+    """Raw bytes alongside mnemonics for one method body. Used by the
+    per-method hex view."""
+    r = state.active_resource()
+    if r is None:
+        return ""
+    cls = next((c for c in r.classes if c.full_name == class_full_name),
+               None)
+    if cls is None:
+        return ""
+    abc = r.resource.abc_blocks[cls.abc_index]
+    body = None
+    for b in abc.method_bodies:
+        if getattr(b, "method", -1) == method_index:
+            body = b
+            break
+    if body is None:
+        return f"// method {method_index} has no body"
+    try:
+        instrs = decode_instructions(body.code)
+        resolved = resolve_instructions(abc, instrs)
+    except Exception as exc:  # noqa: BLE001
+        return f"// decode error: {exc}"
+    lines: list[str] = []
+    lines.append(f"// method #{method_index}  ({len(body.code)} bytes)")
+    lines.append("")
+    code = body.code
+    for r_ in resolved:
+        start = r_.offset
+        end = (resolved[resolved.index(r_) + 1].offset
+               if resolved.index(r_) + 1 < len(resolved)
+               else len(code))
+        raw = code[start:end]
+        hex_col = " ".join(f"{b:02x}" for b in raw[:8])
+        if len(raw) > 8:
+            hex_col += " …"
+        ops = ", ".join(r_.operands) if r_.operands else ""
+        lines.append(
+            f"  {r_.offset:04X}  {hex_col:<27}  {r_.mnemonic:<16}  {ops}"
+        )
+    return "\n".join(lines)
+
+
+# ── SWF asset listing ─────────────────────────────────────────────────
+
+
+# Tag types we export as standalone files.
+_BITMAP_TAGS = {6, 21, 35}              # DefineBits variants (JPEG payload)
+_LOSSLESS_TAGS = {20, 36}               # DefineBitsLossless (zlib BGRA)
+_SOUND_TAGS = {14, 46}                  # DefineSound(+2)
+_FONT_TAGS = {10, 48, 75}               # DefineFont / Font2 / Font3
+_BINARY_TAGS = {87}                     # DefineBinaryData
+
+
+@dataclass(frozen=True)
+class AssetEntry:
+    """Row in the sidebar's Assets section."""
+    tag_index: int       # position in Resource.swf_tags
+    kind: str            # "bitmap" | "sound" | "font" | "binary"
+    name: str            # short label for the row
+    char_id: int
+    size_bytes: int
+
+
+def list_assets(state: StudioState) -> list[AssetEntry]:
+    r = state.active_resource()
+    if r is None or r.resource.swf_tags is None:
+        return []
+    out: list[AssetEntry] = []
+    for i, tag in enumerate(r.resource.swf_tags):
+        tt = tag.tag_type
+        if tt in _BITMAP_TAGS | _LOSSLESS_TAGS:
+            kind = "bitmap"
+        elif tt in _SOUND_TAGS:
+            kind = "sound"
+        elif tt in _FONT_TAGS:
+            kind = "font"
+        elif tt in _BINARY_TAGS:
+            kind = "binary"
+        else:
+            continue
+        payload = tag.payload or b""
+        char_id = (int.from_bytes(payload[:2], "little")
+                   if len(payload) >= 2 else -1)
+        out.append(AssetEntry(
+            tag_index=i, kind=kind,
+            name=f"{kind}_{char_id if char_id >= 0 else i}",
+            char_id=char_id,
+            size_bytes=len(payload),
+        ))
+    return out
+
+
+def export_asset(state: StudioState, entry: AssetEntry,
+                 out_path: Path) -> bool:
+    """Write the raw tag payload (minus the char-id prefix when
+    applicable) to disk. Full format decoding (PNG, WAV, TTF) is a
+    bigger job — this gives you the embedded bytes as-is, which is
+    enough for JPEG bitmaps (.jpg) and DefineBinaryData (.bin)."""
+    r = state.active_resource()
+    if r is None or r.resource.swf_tags is None:
+        return False
+    if not (0 <= entry.tag_index < len(r.resource.swf_tags)):
+        return False
+    tag = r.resource.swf_tags[entry.tag_index]
+    payload = tag.payload or b""
+    # Strip the 2-byte char-id prefix for everything except binary —
+    # binary-data tags also have a reserved u32 after char-id, but
+    # users mostly want the full blob anyway.
+    if entry.kind == "bitmap" and tag.tag_type in _BITMAP_TAGS:
+        data = payload[2:]
+    elif entry.kind == "binary":
+        data = payload[6:]  # char_id (u16) + reserved (u32)
+    else:
+        data = payload[2:]
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(data)
+        return True
+    except OSError as exc:
+        log.warning("export_asset(%s): %s", entry.name, exc)
+        return False
 
 
 def find_in_all(

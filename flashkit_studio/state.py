@@ -19,6 +19,7 @@ from PySide6.QtCore import QObject, Signal
 
 from flashkit.abc.types import AbcFile
 from flashkit.workspace.resource import Resource
+from flashkit.workspace.workspace import Workspace
 
 
 # ── plain-data types ─────────────────────────────────────────────────────
@@ -41,10 +42,24 @@ class LoadedResource:
     """One open SWF and the editor state belonging to it."""
     path: Path
     resource: Resource
+    workspace: Workspace
     classes: list[ClassEntry] = field(default_factory=list)
 
     open_class_tabs: list[str] = field(default_factory=list)
     active_class_full_name: Optional[str] = None
+    bookmarks: dict[str, list[int]] = field(default_factory=dict)
+
+    def toggle_bookmark(self, full_name: str, line: int) -> bool:
+        """Toggle a bookmark on ``(class, line)``. Returns the new state."""
+        lines = self.bookmarks.setdefault(full_name, [])
+        if line in lines:
+            lines.remove(line)
+            if not lines:
+                del self.bookmarks[full_name]
+            return False
+        lines.append(line)
+        lines.sort()
+        return True
 
     @property
     def display_name(self) -> str:
@@ -102,6 +117,8 @@ class StudioState(QObject):
     status_changed = Signal(str, bool, bool)  # text, busy, error
     # Persistent recent-SWFs list changed (a new path was pushed).
     recent_changed = Signal()
+    # Strings/multinames filter changed.
+    pool_filter_changed = Signal()
     # Request to navigate somewhere after a tab is focused.
     # Args: class_full_name, member_name_or_empty, line_number_or_minus1.
     # The editor panel is the sole consumer — it scrolls the code view
@@ -114,6 +131,9 @@ class StudioState(QObject):
         self.resources: list[LoadedResource] = []
         self.active_resource_index: Optional[int] = None
         self.active_view: str = "source"
+        # Filter text for the Strings and Multinames views. Persisted
+        # across view switches but not across SWF opens.
+        self.pool_filter: str = ""
 
     # ── resources ──────────────────────────────────────────────────
 
@@ -204,6 +224,11 @@ class StudioState(QObject):
         if key != self.active_view:
             self.active_view = key
             self.view_changed.emit(key)
+
+    def set_pool_filter(self, text: str) -> None:
+        if text != self.pool_filter:
+            self.pool_filter = text
+            self.pool_filter_changed.emit()
 
     def set_status(self, text: str, *, busy: bool = False, error: bool = False) -> None:
         self.status_changed.emit(text, busy, error)

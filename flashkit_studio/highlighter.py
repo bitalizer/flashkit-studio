@@ -68,6 +68,11 @@ class As3Highlighter(QSyntaxHighlighter):
         self._call    = _fmt(p.syn_function)
         self._builtin = _fmt(p.syn_builtin)
         self._comment = _fmt(p.syn_comment, italic=True)
+        # P-Code-specific formats: offset is the same number colour, the
+        # mnemonic steals the keyword colour, raw bytes dim like comments.
+        self._pc_offset = _fmt(p.syn_number)
+        self._pc_bytes  = _fmt(p.syn_comment)
+        self._pc_mnem   = _fmt(p.syn_keyword, bold=True)
 
         # Order matters: comments first so strings inside them aren't
         # highlighted.
@@ -84,7 +89,40 @@ class As3Highlighter(QSyntaxHighlighter):
         self._block_start = QRegularExpression(r"/\*")
         self._block_end   = QRegularExpression(r"\*/")
 
+        # P-Code line shape — both the hex-dump variant ("  0000  d0 30 …
+        # mnemonic …") and the plain variant ("  0000  mnemonic …") the
+        # disasm renderer used before hex bytes were added.
+        self._pc_line = QRegularExpression(
+            r"^\s+([0-9A-F]{4,})\s+"                   # 1: offset
+            r"(?:((?:[0-9a-f]{2}\s?)+(?:…)?)\s+)?"     # 2: optional hex
+            r"([a-z_][a-z0-9_]*)"                      # 3: mnemonic
+        )
+
     def highlightBlock(self, text: str) -> None:
+        # If this line looks like a P-Code row, apply the disasm
+        # format and skip the AS3 rules (those would try to match
+        # things like "returnvoid" as keywords which is fine, but
+        # also mis-colour hex bytes as identifiers).
+        pc = self._pc_line.match(text)
+        if pc.hasMatch():
+            self.setFormat(pc.capturedStart(1), pc.capturedLength(1),
+                           self._pc_offset)
+            if pc.capturedStart(2) >= 0:
+                self.setFormat(pc.capturedStart(2), pc.capturedLength(2),
+                               self._pc_bytes)
+            self.setFormat(pc.capturedStart(3), pc.capturedLength(3),
+                           self._pc_mnem)
+            # Operands tail can still use AS3 rules (strings, numbers).
+            tail_start = pc.capturedEnd(3)
+            tail = text[tail_start:]
+            for regex, fmt in self._rules[:4]:  # strings + builtins only
+                it = regex.globalMatch(tail)
+                while it.hasNext():
+                    m = it.next()
+                    self.setFormat(tail_start + m.capturedStart(),
+                                   m.capturedLength(), fmt)
+            return
+
         # Apply single-line rules.
         for regex, fmt in self._rules:
             it = regex.globalMatch(text)
