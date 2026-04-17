@@ -110,8 +110,10 @@ class MainWindow(QMainWindow):
 
         # Edit
         m_edit = mb.addMenu("Edit")
+        # Copy Current View copies the whole rendered text. No shortcut
+        # — Ctrl+C is reserved for the native QPlainTextEdit selection
+        # copy so a highlighted span copies only what's highlighted.
         self.act_copy_view = QAction("Copy Current View", self)
-        self.act_copy_view.setShortcut(QKeySequence("Ctrl+C"))
         self.act_copy_view.triggered.connect(self._copy_current_view)
         m_edit.addAction(self.act_copy_view)
 

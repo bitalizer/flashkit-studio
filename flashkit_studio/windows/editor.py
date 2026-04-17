@@ -47,6 +47,44 @@ _VIEWS = [
 ]
 
 
+# Identifier character set — matches what the AS3 decompiler emits for
+# obfuscated names. AS3 only allows ``[A-Za-z_$][A-Za-z_$0-9]*`` in valid
+# source, but obfuscators pack non-printables and symbol chars into the
+# multiname pool; the decompiler passes them through literally.
+_ID_EXTRA = "_$@#!%&+-=?:;<>[]~*`,'\""
+_ID_EXTRA_SET = frozenset(_ID_EXTRA)
+
+
+def _is_id_char(ch: str) -> bool:
+    # Alphanumerics plus the obfuscation-extra set. Dot deliberately
+    # excluded: ``#F.SendPacket`` must break at the dot so we can jump
+    # to ``#F`` (the field on this class) or ``SendPacket`` (the
+    # method on #F's type) independently depending on where the
+    # cursor sits.
+    return ch.isalnum() or ch in _ID_EXTRA_SET
+
+
+def _identifier_under_cursor(cursor: QTextCursor) -> str:
+    """Extract the AS3 identifier surrounding ``cursor``'s position.
+
+    Used by both the Ctrl+click handler on the editor widget and the
+    F12 shortcut on ``_CodeView``.  Qt's built-in ``WordUnderCursor``
+    stops at non-ASCII-word characters, which kills jumps on
+    obfuscated names like ``#F`` or ``@!1``.
+    """
+    text = cursor.block().text()
+    col = cursor.positionInBlock()
+    if not text or col < 0 or col > len(text):
+        return ""
+    start = col
+    while start > 0 and _is_id_char(text[start - 1]):
+        start -= 1
+    end = col
+    while end < len(text) and _is_id_char(text[end]):
+        end += 1
+    return text[start:end]
+
+
 class Editor(QWidget):
     def __init__(self, state: StudioState, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -505,9 +543,7 @@ class _CodeView(QWidget):
     # ── jump-to-definition ────────────────────────────────────────
 
     def _jump_to_cursor_word(self) -> None:
-        cur = self._editor.textCursor()
-        cur.select(QTextCursor.WordUnderCursor)
-        word = cur.selectedText().strip()
+        word = _identifier_under_cursor(self._editor.textCursor())
         if word:
             self._resolve_and_jump(word)
 
@@ -630,8 +666,7 @@ class _PlainCodeEditor(QPlainTextEdit):
         if (event.button() == Qt.LeftButton
                 and event.modifiers() & Qt.ControlModifier):
             cursor = self.cursorForPosition(event.pos())
-            cursor.select(QTextCursor.WordUnderCursor)
-            word = cursor.selectedText().strip()
+            word = _identifier_under_cursor(cursor)
             if word:
                 self.jumpRequested.emit(word)
                 event.accept()
