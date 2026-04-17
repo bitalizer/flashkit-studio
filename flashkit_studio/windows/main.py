@@ -105,6 +105,13 @@ class MainWindow(QMainWindow):
         self.act_copy_view.triggered.connect(self._copy_current_view)
         m_edit.addAction(self.act_copy_view)
 
+        m_edit.addSeparator()
+
+        self.act_find = QAction("Find…", self)
+        self.act_find.setShortcut(QKeySequence.StandardKey.Find)
+        self.act_find.triggered.connect(self._trigger_find)
+        m_edit.addAction(self.act_find)
+
         # Close tab shortcut — Ctrl+W, not in menu (intentional, the
         # right-click tab menu owns close actions).
         act_close_tab = QAction(self)
@@ -146,6 +153,7 @@ class MainWindow(QMainWindow):
         self.act_export_all.setEnabled(has_swf)
         self.act_close_swf.setEnabled(has_swf)
         self.act_copy_view.setEnabled(has_class)
+        self.act_find.setEnabled(has_class)
 
     # ── actions ────────────────────────────────────────────────────
 
@@ -185,6 +193,19 @@ class MainWindow(QMainWindow):
         r = self.state.active_resource()
         if r and r.active_class_full_name:
             self.state.close_class_tab(r.active_class_full_name)
+
+    def _trigger_find(self) -> None:
+        """Open the find bar inside whichever code view currently has
+        the focused class tab."""
+        r = self.state.active_resource()
+        if r is None or not r.active_class_full_name:
+            return
+        editor_panel = self.editor
+        code_view = editor_panel._editors.get(r.active_class_full_name)
+        if code_view is None:
+            return
+        if hasattr(code_view, "_find"):
+            code_view._find.show_and_focus()
 
     def _show_about(self) -> None:
         dlg = _AboutDialog(self)

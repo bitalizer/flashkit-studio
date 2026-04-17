@@ -20,12 +20,12 @@ from __future__ import annotations
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QAction, QColor, QCursor, QFontMetrics, QKeySequence, QPainter,
-    QPen, QShortcut, QTextCursor, QTextDocument,
+    QPen, QShortcut, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
     QAbstractButton, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
     QPlainTextEdit, QPushButton, QSizePolicy, QStackedWidget, QTabBar,
-    QTabWidget, QToolButton, QVBoxLayout, QWidget,
+    QTabWidget, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import actions
@@ -418,33 +418,41 @@ class _FindBar(QFrame):
         super().__init__(parent)
         self._editor = editor
         self.setObjectName("FindBar")
-        self.setFixedHeight(30)
+        self.setFixedHeight(40)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setContentsMargins(10, 6, 8, 6)
         layout.setSpacing(6)
 
         self._input = QLineEdit(self)
-        self._input.setPlaceholderText("Find…")
+        self._input.setObjectName("FindInput")
+        self._input.setPlaceholderText("Find")
+        self._input.setFixedHeight(28)
         self._input.textChanged.connect(self._on_text_changed)
         self._input.returnPressed.connect(self.find_next)
         layout.addWidget(self._input, 1)
 
+        # Status label sits inside the line-edit column (not beside it)
+        # so it doesn't create a second coloured block when empty.
         self._status = QLabel("", self)
-        self._status.setStyleSheet(
-            f"color: {Palette.text_muted}; font-size: 11px;",
-        )
+        self._status.setObjectName("FindStatus")
+        self._status.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._status.setVisible(False)
         layout.addWidget(self._status)
 
         prev = QToolButton(self)
-        prev.setText("↑")
+        prev.setObjectName("FindNav")
+        prev.setText("▲")
+        prev.setFixedSize(24, 28)
         prev.setCursor(QCursor(Qt.PointingHandCursor))
         prev.setToolTip("Previous (Shift+Enter)")
         prev.clicked.connect(self.find_prev)
         layout.addWidget(prev)
 
         nxt = QToolButton(self)
-        nxt.setText("↓")
+        nxt.setObjectName("FindNav")
+        nxt.setText("▼")
+        nxt.setFixedSize(24, 28)
         nxt.setCursor(QCursor(Qt.PointingHandCursor))
         nxt.setToolTip("Next (Enter)")
         nxt.clicked.connect(self.find_next)
@@ -460,24 +468,44 @@ class _FindBar(QFrame):
         esc.setContext(Qt.WidgetWithChildrenShortcut)
         esc.activated.connect(self.hide_and_refocus)
 
-        # Style: subtle top/bottom borders, surface colour.
+        # Scoped stylesheet — no inherited global surface / padding
+        # confuses child widgets.
         self.setStyleSheet(
-            f"QFrame#FindBar {{"
-            f"  background: {Palette.bg_surface};"
-            f"  border-top: 1px solid {Palette.border};"
-            f"  border-bottom: 1px solid {Palette.border};"
-            f"}}"
-            f"QToolButton {{"
-            f"  background: transparent;"
-            f"  color: {Palette.text_muted};"
-            f"  border: none;"
-            f"  padding: 2px 8px;"
-            f"  border-radius: 4px;"
-            f"}}"
-            f"QToolButton:hover {{"
-            f"  background: {Palette.bg_surface_2};"
-            f"  color: {Palette.text_primary};"
-            f"}}",
+            f"""
+            QFrame#FindBar {{
+                background: {Palette.bg_surface};
+                border-bottom: 1px solid {Palette.border};
+            }}
+            QFrame#FindBar QLineEdit#FindInput {{
+                background: {Palette.bg_surface_2};
+                color: {Palette.text_primary};
+                border: 1px solid transparent;
+                border-radius: 4px;
+                padding: 2px 8px;
+                selection-background-color: {Palette.bg_selected};
+            }}
+            QFrame#FindBar QLineEdit#FindInput:focus {{
+                border: 1px solid {Palette.accent_fg};
+            }}
+            QFrame#FindBar QLabel#FindStatus {{
+                color: {Palette.text_muted};
+                background: transparent;
+                padding: 0 8px;
+                font-size: 11px;
+            }}
+            QFrame#FindBar QToolButton#FindNav {{
+                background: transparent;
+                color: {Palette.text_muted};
+                border: none;
+                padding: 0;
+                border-radius: 4px;
+                font-size: 11px;
+            }}
+            QFrame#FindBar QToolButton#FindNav:hover {{
+                background: {Palette.bg_surface_2};
+                color: {Palette.text_primary};
+            }}
+            """,
         )
 
     # ── public slots ──────────────────────────────────────────────
@@ -486,9 +514,17 @@ class _FindBar(QFrame):
         self.setVisible(True)
         self._input.setFocus(Qt.ShortcutFocusReason)
         self._input.selectAll()
+        # If there's residual text in the query box, re-paint matches
+        # so the user sees them immediately.
+        if self._input.text():
+            self._repaint_matches()
+            self._refresh_count(self._input.text())
 
     def hide_and_refocus(self) -> None:
         self.setVisible(False)
+        # Drop all match tints when the bar closes so the code view
+        # returns to a clean state.
+        self._editor.setExtraSelections([])
         self._editor.setFocus(Qt.OtherFocusReason)
 
     def find_next(self) -> None:
@@ -500,17 +536,17 @@ class _FindBar(QFrame):
     # ── internals ────────────────────────────────────────────────
 
     def _on_text_changed(self, _text: str) -> None:
-        # Incremental search: start from the current cursor's anchor
-        # so we don't keep jumping when the user edits the query.
+        # Re-paint all match highlights and jump to the first one.
+        self._repaint_matches()
         cursor = self._editor.textCursor()
         cursor.setPosition(cursor.selectionStart())
         self._editor.setTextCursor(cursor)
-        self._find(forward=True, from_cursor=True)
+        self._find(forward=True)
 
-    def _find(self, *, forward: bool, from_cursor: bool) -> None:
+    def _find(self, *, forward: bool) -> None:
         needle = self._input.text()
         if not needle:
-            self._status.setText("")
+            self._set_status("")
             return
 
         flags = QTextDocument.FindFlag(0)
@@ -527,10 +563,63 @@ class _FindBar(QFrame):
             self._editor.setTextCursor(cursor)
             found = self._editor.find(needle, flags)
 
-        if found:
-            self._status.setText("")
-        else:
-            self._status.setText("No results")
+        self._refresh_count(needle)
+
+    def _repaint_matches(self) -> None:
+        """Walk the whole document and mark every occurrence of the
+        query with a tinted background via ``setExtraSelections``. This
+        is what makes matches *visible* as the user scrolls — ``find()``
+        alone only moves the cursor."""
+        needle = self._input.text()
+        if not needle:
+            self._editor.setExtraSelections([])
+            return
+
+        match_fmt = QTextCharFormat()
+        match_fmt.setBackground(QColor(Palette.accent_fg))
+        # Darken the text so the accent-fg background stays readable.
+        match_fmt.setForeground(QColor(Palette.bg_app))
+
+        selections: list[QTextEdit.ExtraSelection] = []
+        doc = self._editor.document()
+        cursor = QTextCursor(doc)
+        while True:
+            cursor = doc.find(needle, cursor)
+            if cursor.isNull() or not cursor.hasSelection():
+                break
+            sel = QTextEdit.ExtraSelection()
+            sel.format = match_fmt
+            sel.cursor = cursor
+            selections.append(sel)
+
+        self._editor.setExtraSelections(selections)
+        self._match_count = len(selections)
+
+    def _refresh_count(self, needle: str) -> None:
+        if not needle:
+            self._set_status("")
+            return
+        total = getattr(self, "_match_count", 0)
+        if total == 0:
+            self._set_status("No results")
+            return
+        # Figure out which match the cursor is currently sitting on.
+        pos = self._editor.textCursor().selectionStart()
+        doc = self._editor.document()
+        nth = 0
+        cursor = QTextCursor(doc)
+        while True:
+            cursor = doc.find(needle, cursor)
+            if cursor.isNull() or not cursor.hasSelection():
+                break
+            nth += 1
+            if cursor.selectionStart() >= pos:
+                break
+        self._set_status(f"{nth} of {total}")
+
+    def _set_status(self, text: str) -> None:
+        self._status.setText(text)
+        self._status.setVisible(bool(text))
 
 
 # ── welcome page ─────────────────────────────────────────────────────────
