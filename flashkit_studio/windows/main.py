@@ -247,7 +247,14 @@ class MainWindow(QMainWindow):
         left = side == "left"
         self.act_side_left.setChecked(left)
         self.act_side_right.setChecked(not left)
-        # Swap splitter order to move sidebar.
+
+        # Capture the *current* sidebar width so the user's resize
+        # survives the swap — the old code hard-coded 280 and then
+        # assigned it positionally, which put 280 on whichever widget
+        # sat at index 0 (the editor, when moving to "right").
+        sidebar_w = self.sidebar.width() or 280
+        editor_w = max(self.width() - sidebar_w, 400)
+
         sidebar = self.sidebar
         editor  = self.editor
         # Remove both widgets (without destroying) and re-add in the
@@ -255,7 +262,12 @@ class MainWindow(QMainWindow):
         # insertWidget to reorder.
         self.splitter.insertWidget(0 if left else 1, sidebar)
         self.splitter.insertWidget(0 if not left else 1, editor)
-        self.splitter.setSizes([280, self.width() - 280])
+        # Size vector must match the new *index* order, not the
+        # widget identity, so we compose it from left-to-right.
+        if left:
+            self.splitter.setSizes([sidebar_w, editor_w])
+        else:
+            self.splitter.setSizes([editor_w, sidebar_w])
         settings.save_sidebar_side(side)
 
     def _open_palette(self) -> None:
