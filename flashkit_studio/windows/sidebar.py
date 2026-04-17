@@ -20,17 +20,25 @@ from PySide6.QtWidgets import (
     QComboBox, QLabel, QLineEdit, QTreeView, QVBoxLayout, QWidget,
 )
 
+from .. import icons
 from ..state import StudioState, ClassEntry
-from ..theme import Scale
+from ..theme import Palette, Scale
 
 
-# Row-prefix glyphs. Package rows carry a collapse chevron that flips
-# between these two on expand/collapse; class rows are prefixed with a
-# single filled-square so they read as distinct children of their
-# package even when the tree's built-in branch indicator is off.
-_COLLAPSED = "▸"
-_EXPANDED  = "▾"
-_CLASS_GLYPH = "▣"
+def _pkg_icon(expanded: bool):
+    """Chevron that rotates with package expansion state. Cached via
+    ``icons.icon`` so building the sidebar on a large SWF doesn't
+    re-rasterise the same two glyphs 300 times."""
+    name = "chevron_down" if expanded else "chevron_right"
+    return icons.icon(name, size=14, color=Palette.text_muted)
+
+
+def _class_icon():
+    return icons.icon(
+        "class", size=14,
+        color=Palette.accent_fg,
+        bg=Palette.bg_surface_2,
+    )
 
 
 class Sidebar(QWidget):
@@ -168,13 +176,15 @@ class Sidebar(QWidget):
             by_pkg.setdefault(c.package or "(default)", []).append(c)
 
         root = self.model.invisibleRootItem()
+        class_icon = _class_icon()
+        collapsed_icon = _pkg_icon(expanded=False)
         for pkg in sorted(by_pkg):
-            # Start collapsed (▸); _sync_pkg_chevron flips to ▾ on expand.
-            pkg_item = QStandardItem(f"{_COLLAPSED}  {pkg}")
+            # Start collapsed; _sync_pkg_chevron flips the icon on expand.
+            pkg_item = QStandardItem(collapsed_icon, pkg)
             pkg_item.setSelectable(False)
             pkg_item.setData(("pkg", pkg), Qt.UserRole)
             for c in by_pkg[pkg]:
-                item = QStandardItem(f"{_CLASS_GLYPH}  {c.name}")
+                item = QStandardItem(class_icon, c.name)
                 item.setEditable(False)
                 item.setToolTip(c.full_name)
                 item.setData(("class", c), Qt.UserRole)
@@ -199,18 +209,16 @@ class Sidebar(QWidget):
         self._refresh_row_decor()
 
     def _sync_pkg_chevron(self, index) -> None:
-        """Swap ▸/▾ on the package row label when Qt fires expanded
-        or collapsed. ``index`` is always a top-level (package) index
-        because class rows have no children to toggle."""
+        """Rotate the chevron icon on the package row when Qt fires
+        expanded or collapsed. ``index`` is always a top-level
+        (package) index because class rows have no children."""
         item = self.model.itemFromIndex(index)
         if item is None:
             return
         data = item.data(Qt.UserRole)
         if not data or data[0] != "pkg":
             return
-        pkg = data[1]
-        glyph = _EXPANDED if self.tree.isExpanded(index) else _COLLAPSED
-        item.setText(f"{glyph}  {pkg}")
+        item.setIcon(_pkg_icon(self.tree.isExpanded(index)))
 
     def _refresh_row_decor(self) -> None:
         """Style class rows by open-tab state (open = brighter than
