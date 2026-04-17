@@ -932,7 +932,7 @@ class _Outline(QFrame):
     """
 
     _KIND_GLYPH = {
-        "field": "◆", "method": "ƒ", "getter": "›", "setter": "‹",
+        "field": "⬥", "method": "ƒ", "getter": "›", "setter": "‹",
     }
 
     def __init__(self, state: StudioState,
