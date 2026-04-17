@@ -24,6 +24,15 @@ from ..state import StudioState, ClassEntry
 from ..theme import Scale
 
 
+# Row-prefix glyphs. Package rows carry a collapse chevron that flips
+# between these two on expand/collapse; class rows are prefixed with a
+# single filled-square so they read as distinct children of their
+# package even when the tree's built-in branch indicator is off.
+_COLLAPSED = "▸"
+_EXPANDED  = "▾"
+_CLASS_GLYPH = "▣"
+
+
 class Sidebar(QWidget):
     """Left (or right) panel of the main window."""
 
@@ -67,13 +76,19 @@ class Sidebar(QWidget):
         self.tree = QTreeView()
         self.tree.setHeaderHidden(True)
         self.tree.setUniformRowHeights(True)
-        self.tree.setRootIsDecorated(True)
+        # The default Qt branch indicator renders as a tiny raster pixmap
+        # that looks fuzzy on HiDPI, so we paint the chevron ourselves
+        # inside the package row label instead. Turn off the built-in
+        # decoration to avoid a double-indicator gutter.
+        self.tree.setRootIsDecorated(False)
         self.tree.setAnimated(False)
         self.tree.setEditTriggers(QTreeView.NoEditTriggers)
-        self.tree.setIndentation(16)
+        self.tree.setIndentation(12)
         self.tree.setExpandsOnDoubleClick(False)
         self.tree.activated.connect(self._on_tree_activated)
         self.tree.clicked.connect(self._on_tree_activated)
+        self.tree.expanded.connect(self._sync_pkg_chevron)
+        self.tree.collapsed.connect(self._sync_pkg_chevron)
         layout.addWidget(self.tree, 1)
 
         self.model = QStandardItemModel(self.tree)
@@ -154,11 +169,12 @@ class Sidebar(QWidget):
 
         root = self.model.invisibleRootItem()
         for pkg in sorted(by_pkg):
-            pkg_item = QStandardItem(pkg)
+            # Start collapsed (▸); _sync_pkg_chevron flips to ▾ on expand.
+            pkg_item = QStandardItem(f"{_COLLAPSED}  {pkg}")
             pkg_item.setSelectable(False)
             pkg_item.setData(("pkg", pkg), Qt.UserRole)
             for c in by_pkg[pkg]:
-                item = QStandardItem(c.name)
+                item = QStandardItem(f"{_CLASS_GLYPH}  {c.name}")
                 item.setEditable(False)
                 item.setToolTip(c.full_name)
                 item.setData(("class", c), Qt.UserRole)
@@ -174,7 +190,27 @@ class Sidebar(QWidget):
             for i in range(root.rowCount()):
                 self.tree.expand(self.model.index(i, 0))
 
+        # Programmatic expand calls above don't always emit the
+        # ``expanded`` signal, so ensure every visible package row has
+        # the right chevron before the first paint.
+        for i in range(root.rowCount()):
+            self._sync_pkg_chevron(self.model.index(i, 0))
+
         self._refresh_row_decor()
+
+    def _sync_pkg_chevron(self, index) -> None:
+        """Swap ▸/▾ on the package row label when Qt fires expanded
+        or collapsed. ``index`` is always a top-level (package) index
+        because class rows have no children to toggle."""
+        item = self.model.itemFromIndex(index)
+        if item is None:
+            return
+        data = item.data(Qt.UserRole)
+        if not data or data[0] != "pkg":
+            return
+        pkg = data[1]
+        glyph = _EXPANDED if self.tree.isExpanded(index) else _COLLAPSED
+        item.setText(f"{glyph}  {pkg}")
 
     def _refresh_row_decor(self) -> None:
         """Style class rows by open-tab state (open = brighter than
