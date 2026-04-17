@@ -122,10 +122,31 @@ class Sidebar(QWidget):
         self.model.setColumnCount(1)
 
         filter_lower = self.filter.text().lower()
-        filtered = [
-            c for c in self._all_classes
-            if not filter_lower or filter_lower in c.full_name.lower()
-        ]
+        # Filter matches the class's qualified name or any of its
+        # fields/methods — lets a user locate "SomeClass" by typing
+        # "onTick" if that's the method they remember. Member names
+        # come from the workspace ``ClassInfo`` which is already
+        # resolved at load time.
+        filtered = []
+        if not filter_lower:
+            filtered = list(self._all_classes)
+        else:
+            r = self.state.active_resource()
+            ci_by_full = {
+                ci.qualified_name: ci for ci in r.resource.classes
+            } if r else {}
+            for c in self._all_classes:
+                if filter_lower in c.full_name.lower():
+                    filtered.append(c)
+                    continue
+                ci = ci_by_full.get(c.full_name)
+                if ci is None:
+                    continue
+                if any(filter_lower in f.name.lower() for f in ci.all_fields):
+                    filtered.append(c)
+                    continue
+                if any(filter_lower in m.name.lower() for m in ci.all_methods):
+                    filtered.append(c)
 
         by_pkg: dict[str, list[ClassEntry]] = {}
         for c in filtered:

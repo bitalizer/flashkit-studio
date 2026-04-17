@@ -100,6 +100,14 @@ class StudioState(QObject):
     view_changed = Signal(str)
     # Status bar message.
     status_changed = Signal(str, bool, bool)  # text, busy, error
+    # Persistent recent-SWFs list changed (a new path was pushed).
+    recent_changed = Signal()
+    # Request to navigate somewhere after a tab is focused.
+    # Args: class_full_name, member_name_or_empty, line_number_or_minus1.
+    # The editor panel is the sole consumer — it scrolls the code view
+    # to the first line containing the given member identifier or, if
+    # a line is supplied instead, directly to that line.
+    jump_requested = Signal(str, str, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -199,3 +207,20 @@ class StudioState(QObject):
 
     def set_status(self, text: str, *, busy: bool = False, error: bool = False) -> None:
         self.status_changed.emit(text, busy, error)
+
+    # ── navigation ─────────────────────────────────────────────────
+
+    def jump_to(self, full_name: str, *,
+                member: str = "", line: int = -1) -> None:
+        """Open ``full_name`` (creating the tab if needed), focus it,
+        then emit ``jump_requested`` so the editor can scroll to the
+        given member or line. Used by the symbol palette, the
+        find-in-all-files panel, and jump-to-definition."""
+        r = self.active_resource()
+        if r is None:
+            return
+        cls = next((c for c in r.classes if c.full_name == full_name), None)
+        if cls is None:
+            return
+        self.open_class(cls)
+        self.jump_requested.emit(full_name, member, line)

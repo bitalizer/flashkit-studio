@@ -7,13 +7,17 @@ status bar so panel code never sees a raised exception.
 from __future__ import annotations
 
 import logging
+import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from flashkit.abc.disasm import decode_instructions, resolve_instructions
 from flashkit.decompile import decompile_class, list_classes
 from flashkit.workspace.resource import load_swf, load_swz
 
+from . import settings
 from .state import ClassEntry, LoadedResource, StudioState
 
 log = logging.getLogger(__name__)
@@ -49,6 +53,8 @@ def open_swf(state: StudioState, path: str | Path) -> bool:
     state.add_resource(LoadedResource(
         path=p, resource=resource, classes=classes,
     ))
+    settings.push_recent_swf(p)
+    state.recent_changed.emit()
     state.set_status(
         f"Opened {p.name} — {len(classes)} classes, "
         f"{len(resource.abc_blocks)} ABC blocks, {elapsed:.2f}s",
@@ -268,3 +274,162 @@ def export_selection(state: StudioState, out_dir: str | Path) -> int:
     dest.write_text(src, encoding="utf-8")
     state.set_status(f"Exported {cls.full_name} to {dest}")
     return 1
+
+
+# ── outline / symbol index ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Symbol:
+    """One entry in the global symbol palette.
+
+    ``kind`` is one of ``"class"``, ``"method"``, ``"field"`` — enough
+    for the palette to prefix rows with a glyph and for the jump
+    handler to know whether to scroll to a member after opening the
+    class. ``member`` is the bare name for methods/fields, ``None``
+    for classes.
+    """
+    kind: str
+    class_full_name: str
+    class_short_name: str
+    package: str
+    member: Optional[str]
+    label: str
+
+
+@dataclass(frozen=True)
+class OutlineEntry:
+    """One row in the outline pane for the current class."""
+    kind: str          # "field" | "method" | "getter" | "setter"
+    name: str
+    type_name: str     # return type for methods, field type for fields
+    is_static: bool
+
+
+def list_members(resource, full_name: str) -> list[OutlineEntry]:
+    """Return outline rows for the class with qualified name ``full_name``
+    on ``resource``. Looks up the already-resolved ``ClassInfo`` built
+    at load time. Empty list when the name doesn't match any class."""
+    for ci in resource.classes:
+        if ci.qualified_name != full_name:
+            continue
+        out: list[OutlineEntry] = []
+        for f in ci.all_fields:
+            out.append(OutlineEntry(
+                kind="field", name=f.name, type_name=f.type_name,
+                is_static=f.is_static,
+            ))
+        for m in ci.all_methods:
+            kind = ("getter" if m.is_getter
+                    else "setter" if m.is_setter
+                    else "method")
+            out.append(OutlineEntry(
+                kind=kind, name=m.name, type_name=m.return_type,
+                is_static=m.is_static,
+            ))
+        return out
+    return []
+
+
+def build_symbol_index(state: StudioState) -> list[Symbol]:
+    """Collect every class, method, and field in the active resource
+    into a flat list suitable for fuzzy matching in the palette.
+
+    Classes are expanded to include their members so typing
+    ``onTick`` finds ``SomeClass.onTick`` even without knowing which
+    class owns it. The list is rebuilt on demand — SWFs with tens of
+    thousands of symbols still take under a second on a modern
+    machine.
+    """
+    r = state.active_resource()
+    if r is None:
+        return []
+    out: list[Symbol] = []
+    for ci in r.resource.classes:
+        short = ci.name
+        pkg = ci.package
+        full = ci.qualified_name
+        out.append(Symbol(
+            kind="class", class_full_name=full, class_short_name=short,
+            package=pkg, member=None, label=full,
+        ))
+        for f in ci.all_fields:
+            out.append(Symbol(
+                kind="field", class_full_name=full, class_short_name=short,
+                package=pkg, member=f.name, label=f"{short}.{f.name}",
+            ))
+        for m in ci.all_methods:
+            out.append(Symbol(
+                kind="method", class_full_name=full, class_short_name=short,
+                package=pkg, member=m.name, label=f"{short}.{m.name}",
+            ))
+    return out
+
+
+# ── find in all files ──────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class FindHit:
+    class_full_name: str
+    class_short_name: str
+    line_number: int     # 1-based
+    line_text: str
+
+
+def find_in_all(
+    state: StudioState,
+    needle: str,
+    *,
+    case_sensitive: bool = False,
+    limit: int = 2000,
+    progress_cb=None,
+) -> list[FindHit]:
+    """Decompile every class in the active SWF and collect line-level
+    matches for ``needle``. Results from the render cache are reused
+    when available so a warm cache makes this near-instant.
+
+    ``progress_cb(done, total)`` is invoked every few classes so the
+    UI can paint a progress bar without blocking the event loop.
+    ``limit`` caps the number of hits returned — large matches don't
+    fill the palette with useless lines.
+    """
+    r = state.active_resource()
+    if r is None or not needle:
+        return []
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        pattern = re.compile(re.escape(needle), flags)
+    except re.error:
+        return []
+
+    hits: list[FindHit] = []
+    total = len(r.classes)
+    for i, cls in enumerate(r.classes):
+        if progress_cb and (i % 25 == 0):
+            progress_cb(i, total)
+        key = (state.active_resource_index or 0, cls.full_name, "source")
+        text = _CACHE.get(key)
+        if text is None:
+            abc = r.resource.abc_blocks[cls.abc_index]
+            try:
+                text = decompile_class(abc, name=cls.full_name)
+            except Exception:  # noqa: BLE001
+                continue
+            _CACHE[key] = text
+        for lineno, line in enumerate(text.split("\n"), start=1):
+            if pattern.search(line):
+                hits.append(FindHit(
+                    class_full_name=cls.full_name,
+                    class_short_name=cls.name,
+                    line_number=lineno,
+                    line_text=line.rstrip(),
+                ))
+                if len(hits) >= limit:
+                    if progress_cb:
+                        progress_cb(total, total)
+                    return hits
+    if progress_cb:
+        progress_cb(total, total)
+    return hits

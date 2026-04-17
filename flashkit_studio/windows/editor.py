@@ -17,15 +17,18 @@ view switcher is a row of checkable ``QToolButton``s styled as pills.
 
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
-    QAction, QColor, QCursor, QFontMetrics, QKeySequence, QPainter,
-    QPen, QShortcut, QTextCharFormat, QTextCursor, QTextDocument,
+    QAction, QColor, QCursor, QFontMetrics, QKeySequence, QMouseEvent,
+    QPainter, QPen, QShortcut, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
-    QAbstractButton, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
-    QPlainTextEdit, QPushButton, QSizePolicy, QStackedWidget, QTabBar,
-    QTabWidget, QTextEdit, QToolButton, QVBoxLayout, QWidget,
+    QAbstractButton, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMenu, QPlainTextEdit, QPushButton, QSizePolicy,
+    QSplitter, QStackedWidget, QTabBar, QTabWidget, QTextEdit, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from .. import actions
@@ -60,11 +63,22 @@ class Editor(QWidget):
         self.welcome = _Welcome()
         self.stack.addWidget(self.welcome)
 
-        # Page 1: tabs + code area.
+        # Page 1: breadcrumb ∪ (tabs + outline) ∪ view-bar.
         page = QWidget()
         page_layout = QVBoxLayout(page)
         page_layout.setContentsMargins(0, 0, 0, 0)
         page_layout.setSpacing(0)
+
+        self.breadcrumb = _Breadcrumb()
+        page_layout.addWidget(self.breadcrumb)
+
+        # Horizontal splitter: code area on the left, outline on the
+        # right. Outline is user-resizable and remembers its width via
+        # the parent window's splitter-state persistence (QSettings).
+        self.mid_split = QSplitter(Qt.Horizontal)
+        self.mid_split.setHandleWidth(1)
+        self.mid_split.setChildrenCollapsible(False)
+        page_layout.addWidget(self.mid_split, 1)
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -81,7 +95,13 @@ class Editor(QWidget):
         # Tab bar also needs right-click for clicks on the bar itself.
         self.tabs.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tabs.tabBar().customContextMenuRequested.connect(self._on_tab_context_menu)
-        page_layout.addWidget(self.tabs, 1)
+        self.mid_split.addWidget(self.tabs)
+
+        self.outline = _Outline(state)
+        self.mid_split.addWidget(self.outline)
+        self.mid_split.setStretchFactor(0, 1)
+        self.mid_split.setStretchFactor(1, 0)
+        self.mid_split.setSizes([900, 240])
 
         # Bottom view bar.
         self.view_bar = _ViewBar()
@@ -96,6 +116,7 @@ class Editor(QWidget):
         state.active_resource_changed.connect(self._rebuild)
         state.tabs_changed.connect(self._rebuild)
         state.view_changed.connect(self._on_state_view_changed)
+        state.jump_requested.connect(self._on_jump_requested)
 
         self._rebuild()
 
@@ -131,6 +152,14 @@ class Editor(QWidget):
         # View bar reflects active view.
         self.view_bar.set_active(self.state.active_view)
 
+        # Breadcrumb + outline.
+        self.breadcrumb.set_for(
+            self.state.active_class(),
+            package=(self.state.active_class().package
+                     if self.state.active_class() else ""),
+        )
+        self.outline.set_for(r, r.active_class_full_name)
+
     def _sync_tabs(self, open_names: list[str]) -> None:
         """Make `self.tabs` mirror ``open_names``. Avoid rebuilding
         every frame — only add/remove where needed so the user's
@@ -163,7 +192,7 @@ class Editor(QWidget):
                 continue
             cls = next((c for c in r.classes if c.full_name == name), None)
             short = cls.name if cls else name
-            editor = _CodeView(self)
+            editor = _CodeView(self.state, self)
             self._editors[name] = editor
             idx = self.tabs.addTab(editor, short)
             self.tabs.tabBar().setTabData(idx, name)
@@ -214,6 +243,23 @@ class Editor(QWidget):
     def _on_state_view_changed(self, _key: str) -> None:
         self.view_bar.set_active(self.state.active_view)
         self._refresh_current_text()
+
+    def _on_jump_requested(self, full_name: str, member: str, line: int) -> None:
+        """Called by the symbol palette, Find-in-Files, Go-to-Line, and
+        jump-to-definition. Makes sure we're on source view, then
+        scrolls the code view to ``line`` (1-based) or to the first
+        occurrence of ``member`` as a definition keyword."""
+        # Switch to Source — the line/member match only exists there.
+        if self.state.active_view != "source":
+            self.state.set_active_view("source")
+        code = self._editors.get(full_name)
+        if code is None:
+            # Tab not yet built (just opened); _rebuild will run next.
+            return
+        if line > 0:
+            code.scroll_to_line(line)
+        elif member:
+            code.scroll_to_member(member)
 
     def _on_tab_context_menu(self, pos) -> None:
         bar = self.tabs.tabBar()
@@ -345,16 +391,23 @@ class _CodeView(QWidget):
     Find bar appears on Ctrl+F (Cmd+F on mac), hides on Esc. Search
     uses Qt's native ``QTextDocument.find`` so case-insensitive /
     wrap-around behaviour is handled natively.
+
+    Holds a reference to the owning ``StudioState`` so the editor can
+    resolve jump-to-definition lookups against the global symbol
+    index without threading state through every call.
     """
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, state: StudioState,
+                 parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._state = state
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         self._editor = _PlainCodeEditor(self)
+        self._editor.jumpRequested.connect(self._resolve_and_jump)
         self._find   = _FindBar(self._editor, self)
         self._find.setVisible(False)
 
@@ -374,6 +427,56 @@ class _CodeView(QWidget):
         sc_prev.setContext(Qt.WidgetWithChildrenShortcut)
         sc_prev.activated.connect(self._find.find_prev)
 
+        # F12 — jump to definition of the word under the cursor.
+        sc_def = QShortcut(QKeySequence("F12"), self)
+        sc_def.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_def.activated.connect(self._jump_to_cursor_word)
+
+    # ── jump-to-definition ────────────────────────────────────────
+
+    def _jump_to_cursor_word(self) -> None:
+        cur = self._editor.textCursor()
+        cur.select(QTextCursor.WordUnderCursor)
+        word = cur.selectedText().strip()
+        if word:
+            self._resolve_and_jump(word)
+
+    def _resolve_and_jump(self, word: str) -> None:
+        """Resolve ``word`` against the global symbol index. Prefers an
+        exact class-name match, then a unique method/field match; if
+        the word is ambiguous (same method name on many classes) we
+        open the palette pre-filled with it so the user can pick."""
+        if self._state.active_resource() is None or not word:
+            return
+        symbols = actions.build_symbol_index(self._state)
+        # Class hits first — exact short name or exact full name.
+        for s in symbols:
+            if s.kind == "class" and (
+                s.class_short_name == word or s.class_full_name == word
+            ):
+                self._state.jump_to(s.class_full_name)
+                return
+        # Member hits.
+        member_hits = [
+            s for s in symbols
+            if s.kind != "class" and s.member == word
+        ]
+        if len(member_hits) == 1:
+            s = member_hits[0]
+            self._state.jump_to(s.class_full_name, member=s.member)
+            return
+        if member_hits:
+            # Ambiguous — open the palette pre-filled so the user chooses.
+            from .palette import SymbolPalette
+            dlg = SymbolPalette(self._state, self.window())
+            dlg._input.setText(word)
+            geo = self.window().geometry()
+            dlg.move(
+                geo.x() + (geo.width() - dlg.width()) // 2,
+                geo.y() + 120,
+            )
+            dlg.exec()
+
     # ── API expected by the editor container ──────────────────────
 
     def toPlainText(self) -> str:
@@ -383,10 +486,57 @@ class _CodeView(QWidget):
         self._editor.setPlainText(text)
         self._editor.verticalScrollBar().setValue(0)
 
+    def scroll_to_line(self, line: int) -> None:
+        """Centre the editor on the given 1-based line number."""
+        block = self._editor.document().findBlockByLineNumber(
+            max(0, line - 1),
+        )
+        if not block.isValid():
+            return
+        cursor = QTextCursor(block)
+        self._editor.setTextCursor(cursor)
+        self._editor.centerCursor()
+        self._editor.setFocus()
+
+    def scroll_to_member(self, member: str) -> None:
+        """Find ``function member(`` or ``function get/set member(`` or
+        ``var member`` / ``const member`` in the current source and
+        scroll to it. Falls back to a plain-text ``member`` search if
+        none of the definition forms match."""
+        if not member:
+            return
+        text = self._editor.toPlainText()
+        patterns = [
+            rf"\bfunction\s+(?:get|set)\s+{re.escape(member)}\b",
+            rf"\bfunction\s+{re.escape(member)}\b",
+            rf"\b(?:var|const)\s+{re.escape(member)}\b",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                line = text.count("\n", 0, m.start()) + 1
+                self.scroll_to_line(line)
+                return
+        # Fallback — plain find.
+        idx = text.find(member)
+        if idx >= 0:
+            line = text.count("\n", 0, idx) + 1
+            self.scroll_to_line(line)
+
 
 class _PlainCodeEditor(QPlainTextEdit):
-    """The text pane — same behaviour as before but now wrapped inside
-    ``_CodeView`` which owns the find bar."""
+    """Text pane with a left-side line-number gutter.
+
+    The gutter is a sibling ``_LineNumberGutter`` widget positioned by
+    ``resizeEvent`` and repainted whenever the editor scrolls or its
+    block count changes. Keeping the gutter as a sibling (rather than
+    a custom ``paintEvent`` on the editor itself) preserves
+    ``QPlainTextEdit`` selection handling and HiDPI text rendering.
+    """
+
+    # Emitted when the user Ctrl+clicks a word; the payload is the
+    # identifier under the cursor.
+    jumpRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -398,6 +548,103 @@ class _PlainCodeEditor(QPlainTextEdit):
             QFontMetrics(self.font()).horizontalAdvance(" ") * 4,
         )
         self._highlighter = As3Highlighter(self.document())
+
+        self._gutter = _LineNumberGutter(self)
+        self.blockCountChanged.connect(self._update_gutter_width)
+        self.updateRequest.connect(self._on_update_request)
+        self._update_gutter_width()
+
+        self.setMouseTracking(True)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (event.button() == Qt.LeftButton
+                and event.modifiers() & Qt.ControlModifier):
+            cursor = self.cursorForPosition(event.pos())
+            cursor.select(QTextCursor.WordUnderCursor)
+            word = cursor.selectedText().strip()
+            if word:
+                self.jumpRequested.emit(word)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    # ── gutter plumbing ─────────────────────────────────────────────
+
+    def gutter_width(self) -> int:
+        count = max(1, self.blockCount())
+        digits = len(str(count))
+        # Two chars of padding on either side of the number.
+        char = QFontMetrics(self.font()).horizontalAdvance("9")
+        return 12 + char * digits + 8
+
+    def _update_gutter_width(self) -> None:
+        self.setViewportMargins(self.gutter_width(), 0, 0, 0)
+
+    def _on_update_request(self, rect, dy: int) -> None:
+        if dy:
+            self._gutter.scroll(0, dy)
+        else:
+            self._gutter.update(0, rect.y(), self._gutter.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_gutter_width()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self._gutter.setGeometry(
+            QRect(cr.left(), cr.top(), self.gutter_width(), cr.height()),
+        )
+
+    def paint_gutter(self, event) -> None:
+        from PySide6.QtGui import QPainter as _QPainter
+
+        painter = _QPainter(self._gutter)
+        painter.fillRect(event.rect(), QColor(Palette.bg_app))
+
+        block = self.firstVisibleBlock()
+        block_num = block.blockNumber()
+        top = int(self.blockBoundingGeometry(block)
+                  .translated(self.contentOffset()).top())
+        bottom = top + int(self.blockBoundingRect(block).height())
+
+        current_block = self.textCursor().blockNumber()
+        active_color = QColor(Palette.text_secondary)
+        idle_color = QColor(Palette.text_disabled)
+        painter.setFont(self.font())
+        right_pad = 8
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                painter.setPen(active_color if block_num == current_block
+                               else idle_color)
+                painter.drawText(
+                    0, top,
+                    self._gutter.width() - right_pad,
+                    QFontMetrics(self.font()).height(),
+                    Qt.AlignRight,
+                    str(block_num + 1),
+                )
+            block = block.next()
+            top = bottom
+            bottom = top + int(self.blockBoundingRect(block).height())
+            block_num += 1
+        painter.end()
+
+
+class _LineNumberGutter(QWidget):
+    """Thin left-side widget that delegates its painting to the host
+    ``_PlainCodeEditor`` — the editor is what knows the text block
+    geometry."""
+
+    def __init__(self, editor: "_PlainCodeEditor") -> None:
+        super().__init__(editor)
+        self._editor = editor
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._editor.gutter_width(), 0)
+
+    def paintEvent(self, event) -> None:
+        self._editor.paint_gutter(event)
 
 
 class _FindBar(QFrame):
@@ -620,6 +867,148 @@ class _FindBar(QFrame):
     def _set_status(self, text: str) -> None:
         self._status.setText(text)
         self._status.setVisible(bool(text))
+
+
+# ── breadcrumb ───────────────────────────────────────────────────────────
+
+
+class _Breadcrumb(QFrame):
+    """Thin strip above the tab area showing ``package > ClassName``.
+
+    A dedicated row so the current class identity is always visible
+    even when tabs are scrolled off-screen on a wide workspace.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("Breadcrumb")
+        self.setFixedHeight(24)
+        self.setStyleSheet(
+            f"""
+            QFrame#Breadcrumb {{
+                background: {Palette.bg_surface};
+                border-bottom: 1px solid {Palette.border};
+            }}
+            QFrame#Breadcrumb QLabel {{
+                color: {Palette.text_muted};
+                font-size: 11px;
+                padding: 0 10px;
+                background: transparent;
+            }}
+            QFrame#Breadcrumb QLabel#BreadcrumbName {{
+                color: {Palette.text_primary};
+                font-weight: 600;
+            }}
+            """,
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self._label = QLabel("", self)
+        layout.addWidget(self._label)
+        layout.addStretch(1)
+
+    def set_for(self, cls: ClassEntry | None, package: str = "") -> None:
+        if cls is None:
+            self._label.setText("")
+            return
+        pkg = package or cls.package or "(default)"
+        self._label.setText(
+            f"{pkg}  ›  <span style='color:{Palette.text_primary};"
+            f"font-weight:600;'>{cls.name}</span>",
+        )
+        self._label.setTextFormat(Qt.RichText)
+
+
+# ── outline pane ─────────────────────────────────────────────────────────
+
+
+class _Outline(QFrame):
+    """Right-side list of fields + methods for the active class.
+
+    Updated whenever ``tabs_changed`` or ``active_resource_changed``
+    fires. Clicking a row jumps the code view to the member.
+    """
+
+    _KIND_GLYPH = {
+        "field": "◆", "method": "ƒ", "getter": "›", "setter": "‹",
+    }
+
+    def __init__(self, state: StudioState,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._state = state
+        self.setObjectName("Outline")
+        self.setMinimumWidth(180)
+        self.setStyleSheet(
+            f"""
+            QFrame#Outline {{
+                background: {Palette.bg_surface};
+                border-left: 1px solid {Palette.border};
+            }}
+            QLabel#OutlineCaption {{
+                color: {Palette.text_muted};
+                font-size: 10px;
+                font-weight: 600;
+                letter-spacing: 1px;
+                padding: 8px 10px 4px 10px;
+                background: transparent;
+            }}
+            QListWidget#OutlineList {{
+                background: transparent;
+                color: {Palette.text_secondary};
+                border: none;
+                padding: 2px 4px;
+                outline: 0;
+                selection-background-color: {Palette.bg_selected};
+                selection-color: {Palette.text_primary};
+            }}
+            QListWidget#OutlineList::item {{
+                padding: 3px 6px;
+                border-radius: 3px;
+            }}
+            QListWidget#OutlineList::item:hover {{
+                background: {Palette.bg_surface_2};
+            }}
+            QListWidget#OutlineList::item:selected {{
+                background: {Palette.bg_selected};
+                color: {Palette.text_primary};
+            }}
+            """,
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        caption = QLabel("OUTLINE", self)
+        caption.setObjectName("OutlineCaption")
+        layout.addWidget(caption)
+        self._list = QListWidget(self)
+        self._list.setObjectName("OutlineList")
+        self._list.setUniformItemSizes(True)
+        self._list.itemActivated.connect(self._on_activate)
+        self._list.itemClicked.connect(self._on_activate)
+        layout.addWidget(self._list, 1)
+
+    def set_for(self, resource, full_name: str | None) -> None:
+        self._list.clear()
+        if resource is None or not full_name:
+            return
+        self._full_name = full_name
+        members = actions.list_members(resource.resource, full_name)
+        for m in members:
+            glyph = self._KIND_GLYPH.get(m.kind, "•")
+            static = " static" if m.is_static else ""
+            label = f"{glyph}  {m.name}  : {m.type_name}{static}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, m.name)
+            self._list.addItem(item)
+
+    def _on_activate(self, item: QListWidgetItem) -> None:
+        name = item.data(Qt.UserRole)
+        if not name or not hasattr(self, "_full_name"):
+            return
+        self._state.jump_requested.emit(self._full_name, str(name), -1)
 
 
 # ── welcome page ─────────────────────────────────────────────────────────

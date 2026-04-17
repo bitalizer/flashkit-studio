@@ -7,15 +7,16 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
-    QMainWindow, QPushButton, QSplitter, QStatusBar, QVBoxLayout,
-    QWidget,
+    QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog,
+    QLabel, QMainWindow, QPushButton, QSplitter, QStatusBar,
+    QVBoxLayout, QWidget,
 )
 
-from .. import actions
+from .. import actions, settings
 from ..state import StudioState
 from ..theme import Scale
 from .editor import Editor
+from .palette import SymbolPalette
 from .sidebar import Sidebar
 
 
@@ -26,6 +27,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("FlashKit Studio")
         self.resize(1360, 840)
+        self.setAcceptDrops(True)
 
         # Splitter: sidebar | editor.
         self.splitter = QSplitter(Qt.Horizontal)
@@ -61,6 +63,11 @@ class MainWindow(QMainWindow):
         state.status_changed.connect(self._on_status)
         state.resources_changed.connect(self._update_status_right)
         state.active_resource_changed.connect(self._update_status_right)
+        state.tabs_changed.connect(self._update_status_right)
+        state.recent_changed.connect(self._rebuild_recent_menu)
+
+        # Restore persisted window state if any.
+        self._restore_window_state()
 
     # ── menu ───────────────────────────────────────────────────────
 
@@ -75,6 +82,9 @@ class MainWindow(QMainWindow):
         act_open.setShortcut(QKeySequence("Ctrl+O"))
         act_open.triggered.connect(self._open_dialog)
         m_file.addAction(act_open)
+
+        self.m_recent = m_file.addMenu("Open Recent")
+        self._rebuild_recent_menu()
 
         self.m_export = m_file.addMenu("Export")
         self.act_export_sel = QAction("Export Selection…", self)
@@ -111,6 +121,23 @@ class MainWindow(QMainWindow):
         self.act_find.setShortcut(QKeySequence.StandardKey.Find)
         self.act_find.triggered.connect(self._trigger_find)
         m_edit.addAction(self.act_find)
+
+        self.act_find_all = QAction("Find in Files…", self)
+        self.act_find_all.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        self.act_find_all.triggered.connect(self._open_find_in_files)
+        m_edit.addAction(self.act_find_all)
+
+        m_edit.addSeparator()
+
+        self.act_palette = QAction("Go to Symbol…", self)
+        self.act_palette.setShortcut(QKeySequence("Ctrl+P"))
+        self.act_palette.triggered.connect(self._open_palette)
+        m_edit.addAction(self.act_palette)
+
+        self.act_goto_line = QAction("Go to Line…", self)
+        self.act_goto_line.setShortcut(QKeySequence("Ctrl+G"))
+        self.act_goto_line.triggered.connect(self._open_goto_line)
+        m_edit.addAction(self.act_goto_line)
 
         # Close tab shortcut — Ctrl+W, not in menu (intentional, the
         # right-click tab menu owns close actions).
@@ -154,6 +181,9 @@ class MainWindow(QMainWindow):
         self.act_close_swf.setEnabled(has_swf)
         self.act_copy_view.setEnabled(has_class)
         self.act_find.setEnabled(has_class)
+        self.act_find_all.setEnabled(has_swf)
+        self.act_palette.setEnabled(has_swf)
+        self.act_goto_line.setEnabled(has_class)
 
     # ── actions ────────────────────────────────────────────────────
 
@@ -224,6 +254,112 @@ class MainWindow(QMainWindow):
         self.splitter.insertWidget(0 if left else 1, sidebar)
         self.splitter.insertWidget(0 if not left else 1, editor)
         self.splitter.setSizes([280, self.width() - 280])
+        settings.save_sidebar_side(side)
+
+    def _open_palette(self) -> None:
+        if self.state.active_resource() is None:
+            return
+        dlg = SymbolPalette(self.state, self)
+        # Centre over the main window.
+        geo = self.geometry()
+        dlg.move(
+            geo.x() + (geo.width() - dlg.width()) // 2,
+            geo.y() + 120,
+        )
+        dlg.exec()
+
+    def _open_find_in_files(self) -> None:
+        if self.state.active_resource() is None:
+            return
+        # Late import to avoid a cycle when building the menu.
+        from .find_all import FindInFilesDialog
+        dlg = FindInFilesDialog(self.state, self)
+        dlg.exec()
+
+    def _open_goto_line(self) -> None:
+        r = self.state.active_resource()
+        if r is None or not r.active_class_full_name:
+            return
+        line, ok = QInputDialog.getInt(
+            self, "Go to Line", "Line number:",
+            1, 1, 999999, 1,
+        )
+        if ok:
+            self.state.jump_requested.emit(
+                r.active_class_full_name, "", int(line),
+            )
+
+    # ── recent SWFs ───────────────────────────────────────────────
+
+    def _rebuild_recent_menu(self) -> None:
+        self.m_recent.clear()
+        recents = settings.recent_swfs()
+        if not recents:
+            placeholder = QAction("(no recent files)", self)
+            placeholder.setEnabled(False)
+            self.m_recent.addAction(placeholder)
+            return
+        for p in recents:
+            act = QAction(str(p), self)
+            act.triggered.connect(
+                lambda _checked=False, path=str(p):
+                    actions.open_swf(self.state, path),
+            )
+            self.m_recent.addAction(act)
+        self.m_recent.addSeparator()
+        clear = QAction("Clear Recent", self)
+        clear.triggered.connect(self._clear_recent)
+        self.m_recent.addAction(clear)
+
+    def _clear_recent(self) -> None:
+        settings.clear_recent_swfs()
+        self._rebuild_recent_menu()
+
+    # ── window state persistence ─────────────────────────────────
+
+    def _restore_window_state(self) -> None:
+        geo, state, splitter = settings.load_window_state()
+        if geo:
+            self.restoreGeometry(geo)
+        if state:
+            self.restoreState(state)
+        if splitter:
+            self.splitter.restoreState(splitter)
+        # Restore sidebar side.
+        side = settings.load_sidebar_side("left")
+        if side == "right":
+            # Call the same helper used by the menu so state + splitter
+            # both update.
+            self._set_sidebar_side("right")
+
+    def closeEvent(self, event) -> None:
+        settings.save_window_state(
+            self.saveGeometry(),
+            self.saveState(),
+            self.splitter.saveState(),
+        )
+        super().closeEvent(event)
+
+    # ── drag and drop (SWF files onto window) ────────────────────
+
+    def dragEnterEvent(self, event) -> None:
+        md = event.mimeData()
+        if not md.hasUrls():
+            event.ignore()
+            return
+        for url in md.urls():
+            path = url.toLocalFile().lower()
+            if path.endswith((".swf", ".swz")):
+                event.acceptProposedAction()
+                return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith((".swf", ".swz")):
+                actions.open_swf(self.state, path)
+        event.acceptProposedAction()
 
     # ── status bar ────────────────────────────────────────────────
 
@@ -240,8 +376,25 @@ class MainWindow(QMainWindow):
         r = self.state.active_resource()
         if r is None:
             self._status_right.setText("")
-        else:
+            return
+        cls = self.state.active_class()
+        if cls is None:
             self._status_right.setText(f"{len(r.classes)} classes")
+            return
+        ci = next(
+            (c for c in r.resource.classes
+             if c.qualified_name == cls.full_name),
+            None,
+        )
+        if ci is None:
+            self._status_right.setText(f"{len(r.classes)} classes")
+            return
+        methods = len(ci.all_methods)
+        fields = len(ci.all_fields)
+        self._status_right.setText(
+            f"{len(r.classes)} classes  ·  "
+            f"{cls.name}: {methods} methods, {fields} fields",
+        )
 
 
 # ── About dialog ─────────────────────────────────────────────────────────
