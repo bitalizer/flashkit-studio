@@ -465,16 +465,18 @@ class _CodeView(QWidget):
         layout.addWidget(self._find)
         layout.addWidget(self._editor, 1)
 
-        # Cross-platform standard shortcut (Ctrl+F / Cmd+F).
-        sc_find = QShortcut(QKeySequence.StandardKey.Find, self)
-        sc_find.setContext(Qt.WidgetWithChildrenShortcut)
-        sc_find.activated.connect(self._find.show_and_focus)
-
-        sc_next = QShortcut(QKeySequence.StandardKey.FindNext, self)
+        # Find-next / find-previous only. Ctrl+F itself is owned by
+        # the menu-bar QAction in MainWindow (_trigger_find) — duplicating
+        # it here made Qt log "Ambiguous shortcut overload" whenever
+        # focus was inside a code view. ``F3`` is the single mapping
+        # we bind for next; StandardKey.FindNext would also claim
+        # Ctrl+G on some platforms, colliding with the Go-to-Line
+        # menu action.
+        sc_next = QShortcut(QKeySequence("F3"), self)
         sc_next.setContext(Qt.WidgetWithChildrenShortcut)
         sc_next.activated.connect(self._find.find_next)
 
-        sc_prev = QShortcut(QKeySequence.StandardKey.FindPrevious, self)
+        sc_prev = QShortcut(QKeySequence("Shift+F3"), self)
         sc_prev.setContext(Qt.WidgetWithChildrenShortcut)
         sc_prev.activated.connect(self._find.find_prev)
 
