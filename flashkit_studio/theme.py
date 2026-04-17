@@ -63,7 +63,7 @@ UI_FAMILY: str = "Inter"
 CODE_FAMILY: str = "JetBrains Mono"
 
 UI_SIZE = 10      # pt (Qt uses points)
-CODE_SIZE = 11
+CODE_SIZE = 10    # matches modern editor defaults
 
 
 def load_fonts() -> None:

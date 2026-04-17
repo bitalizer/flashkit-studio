@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QSize, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
-    QFileDialog, QLabel, QMainWindow, QSplitter, QStatusBar, QWidget,
+    QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
+    QMainWindow, QPushButton, QSplitter, QStatusBar, QVBoxLayout,
+    QWidget,
 )
 
 from .. import actions
 from ..state import StudioState
+from ..theme import Scale
 from .editor import Editor
 from .sidebar import Sidebar
 
@@ -22,6 +27,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("FlashKit Studio")
         self.resize(1360, 840)
 
+        # Splitter: sidebar | editor.
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(1)
@@ -37,10 +43,13 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(self.splitter)
 
+        # Wire sidebar → state.
         self.sidebar.classClicked.connect(state.open_class)
 
+        # Menu bar.
         self._build_menu()
 
+        # Status bar.
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
         self._status_left = QLabel("Ready")
@@ -57,7 +66,7 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         mb = self.menuBar()
-        mb.setNativeMenuBar(False)
+        mb.setNativeMenuBar(False)  # keep our stylesheet on mac too
 
         # File
         m_file = mb.addMenu("File")
@@ -67,20 +76,20 @@ class MainWindow(QMainWindow):
         act_open.triggered.connect(self._open_dialog)
         m_file.addAction(act_open)
 
-        m_export = m_file.addMenu("Export")
-        act_export_sel = QAction("Export Selection…", self)
-        act_export_sel.triggered.connect(self._export_selection_dialog)
-        m_export.addAction(act_export_sel)
-        act_export_all = QAction("Export All…", self)
-        act_export_all.triggered.connect(self._export_all_dialog)
-        m_export.addAction(act_export_all)
+        self.m_export = m_file.addMenu("Export")
+        self.act_export_sel = QAction("Export Selection…", self)
+        self.act_export_sel.triggered.connect(self._export_selection_dialog)
+        self.m_export.addAction(self.act_export_sel)
+        self.act_export_all = QAction("Export All…", self)
+        self.act_export_all.triggered.connect(self._export_all_dialog)
+        self.m_export.addAction(self.act_export_all)
 
         m_file.addSeparator()
 
-        act_close_swf = QAction("Close SWF", self)
-        act_close_swf.setShortcut(QKeySequence("Ctrl+Shift+W"))
-        act_close_swf.triggered.connect(self._close_current_swf)
-        m_file.addAction(act_close_swf)
+        self.act_close_swf = QAction("Close SWF", self)
+        self.act_close_swf.setShortcut(QKeySequence("Ctrl+Shift+W"))
+        self.act_close_swf.triggered.connect(self._close_current_swf)
+        m_file.addAction(self.act_close_swf)
 
         m_file.addSeparator()
 
@@ -91,11 +100,13 @@ class MainWindow(QMainWindow):
 
         # Edit
         m_edit = mb.addMenu("Edit")
-        act_copy_view = QAction("Copy Current View", self)
-        act_copy_view.setShortcut(QKeySequence("Ctrl+C"))
-        act_copy_view.triggered.connect(self._copy_current_view)
-        m_edit.addAction(act_copy_view)
+        self.act_copy_view = QAction("Copy Current View", self)
+        self.act_copy_view.setShortcut(QKeySequence("Ctrl+C"))
+        self.act_copy_view.triggered.connect(self._copy_current_view)
+        m_edit.addAction(self.act_copy_view)
 
+        # Close tab shortcut — Ctrl+W, not in menu (intentional, the
+        # right-click tab menu owns close actions).
         act_close_tab = QAction(self)
         act_close_tab.setShortcut(QKeySequence("Ctrl+W"))
         act_close_tab.setShortcutContext(Qt.ApplicationShortcut)
@@ -114,11 +125,27 @@ class MainWindow(QMainWindow):
 
         # Help
         m_help = mb.addMenu("Help")
-        act_about = QAction("About", self)
-        act_about.triggered.connect(lambda: self.state.set_status(
-            "FlashKit Studio — SWF inspector built on flashkit.",
-        ))
+        act_about = QAction("About FlashKit Studio", self)
+        act_about.triggered.connect(self._show_about)
         m_help.addAction(act_about)
+
+        # Keep menu item enabled-ness in sync with state.
+        self.state.active_resource_changed.connect(self._refresh_menu_enabled)
+        self.state.tabs_changed.connect(self._refresh_menu_enabled)
+        self._refresh_menu_enabled()
+
+    def _refresh_menu_enabled(self) -> None:
+        r = self.state.active_resource()
+        cls = self.state.active_class()
+        has_swf = r is not None
+        has_class = cls is not None
+        # Disable the whole Export submenu when nothing's loaded so
+        # the arrow chevron reads disabled too.
+        self.m_export.menuAction().setEnabled(has_swf)
+        self.act_export_sel.setEnabled(has_class)
+        self.act_export_all.setEnabled(has_swf)
+        self.act_close_swf.setEnabled(has_swf)
+        self.act_copy_view.setEnabled(has_class)
 
     # ── actions ────────────────────────────────────────────────────
 
@@ -159,12 +186,22 @@ class MainWindow(QMainWindow):
         if r and r.active_class_full_name:
             self.state.close_class_tab(r.active_class_full_name)
 
+    def _show_about(self) -> None:
+        dlg = _AboutDialog(self)
+        dlg.exec()
+
     def _set_sidebar_side(self, side: str) -> None:
         left = side == "left"
         self.act_side_left.setChecked(left)
         self.act_side_right.setChecked(not left)
-        self.splitter.insertWidget(0 if left else 1, self.sidebar)
-        self.splitter.insertWidget(0 if not left else 1, self.editor)
+        # Swap splitter order to move sidebar.
+        sidebar = self.sidebar
+        editor  = self.editor
+        # Remove both widgets (without destroying) and re-add in the
+        # new order. QSplitter keeps hidden references; we use
+        # insertWidget to reorder.
+        self.splitter.insertWidget(0 if left else 1, sidebar)
+        self.splitter.insertWidget(0 if not left else 1, editor)
         self.splitter.setSizes([280, self.width() - 280])
 
     # ── status bar ────────────────────────────────────────────────
@@ -184,3 +221,78 @@ class MainWindow(QMainWindow):
             self._status_right.setText("")
         else:
             self._status_right.setText(f"{len(r.classes)} classes")
+
+
+# ── About dialog ─────────────────────────────────────────────────────────
+
+
+class _AboutDialog(QDialog):
+    """Modal info panel shown from Help → About."""
+
+    _REPO_URL = "https://github.com/bitalizer/flashkit"
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("About FlashKit Studio")
+        self.setModal(True)
+        self.setFixedWidth(440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 16)
+        layout.setSpacing(10)
+
+        # Package version — pulled from the studio package metadata.
+        try:
+            from .. import __version__ as app_version
+        except Exception:
+            app_version = "0.1.0"
+
+        title = QLabel("FlashKit Studio")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(f"Version {app_version}")
+        subtitle.setStyleSheet("color: #a7abb3; font-size: 12px;")
+        layout.addWidget(subtitle)
+
+        layout.addSpacing(6)
+
+        desc = QLabel(
+            "A desktop SWF inspector built on the flashkit library.\n"
+            "Open, browse, and decompile AVM2 bytecode",
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #e4e6ea;")
+        layout.addWidget(desc)
+
+        layout.addSpacing(6)
+
+        repo_row = QHBoxLayout()
+        repo_row.setSpacing(6)
+        repo_label = QLabel("GitHub:")
+        repo_label.setStyleSheet("color: #6d727b;")
+        repo_row.addWidget(repo_label)
+
+        repo_link = QLabel(
+            f'<a style="color:#5e9ce6; text-decoration:none;" '
+            f'href="{self._REPO_URL}">bitalizer/flashkit</a>',
+        )
+        repo_link.setOpenExternalLinks(True)
+        repo_link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        repo_row.addWidget(repo_link, 1)
+        layout.addLayout(repo_row)
+
+        layout.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+
+        # Also provide a button to open the repo in the default browser.
+        open_btn = QPushButton("Open Repository")
+        open_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(self._REPO_URL)),
+        )
+        buttons.addButton(open_btn, QDialogButtonBox.ActionRole)
+
+        layout.addWidget(buttons)

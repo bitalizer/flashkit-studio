@@ -17,16 +17,20 @@ view switcher is a row of checkable ``QToolButton``s styled as pills.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCursor, QFontMetrics
+from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QAction, QColor, QCursor, QFontMetrics, QKeySequence, QPainter,
+    QPen, QShortcut, QTextCursor, QTextDocument,
+)
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QStackedWidget,
-    QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget,
+    QAbstractButton, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
+    QPlainTextEdit, QPushButton, QSizePolicy, QStackedWidget, QTabBar,
+    QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import actions
 from ..highlighter import As3Highlighter
-from ..state import StudioState
+from ..state import StudioState, ClassEntry
 from ..theme import Palette, Scale, code_font
 
 
@@ -48,12 +52,15 @@ class Editor(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # Tab bar + (later) welcome state live in a stacked widget.
         self.stack = QStackedWidget()
         layout.addWidget(self.stack, 1)
 
+        # Page 0: welcome.
         self.welcome = _Welcome()
         self.stack.addWidget(self.welcome)
 
+        # Page 1: tabs + code area.
         page = QWidget()
         page_layout = QVBoxLayout(page)
         page_layout.setContentsMargins(0, 0, 0, 0)
@@ -61,19 +68,29 @@ class Editor(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        self.tabs.setTabsClosable(True)
+        # We supply our own per-tab close button (``_CloseButton``)
+        # via ``QTabBar.setTabButton`` so the × glyph renders crisply
+        # on HiDPI — Qt's default ``tabsClosable`` button is a small
+        # raster pixmap that looks fuzzy on scaled displays.
+        self.tabs.setTabsClosable(False)
         self.tabs.setMovable(True)
         self.tabs.setUsesScrollButtons(True)
-        self.tabs.tabCloseRequested.connect(self._on_close)
         self.tabs.currentChanged.connect(self._on_current_changed)
+        self.tabs.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tabs.customContextMenuRequested.connect(self._on_tab_context_menu)
+        # Tab bar also needs right-click for clicks on the bar itself.
+        self.tabs.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tabs.tabBar().customContextMenuRequested.connect(self._on_tab_context_menu)
         page_layout.addWidget(self.tabs, 1)
 
+        # Bottom view bar.
         self.view_bar = _ViewBar()
         self.view_bar.viewChanged.connect(self._on_view_changed)
         page_layout.addWidget(self.view_bar)
 
         self.stack.addWidget(page)
 
+        # ── state ─────────────────────────────────────────────
         self._editors: dict[str, _CodeView] = {}
 
         state.active_resource_changed.connect(self._rebuild)
@@ -81,6 +98,8 @@ class Editor(QWidget):
         state.view_changed.connect(self._on_state_view_changed)
 
         self._rebuild()
+
+    # ── wiring ───────────────────────────────────────────────────
 
     def _rebuild(self) -> None:
         r = self.state.active_resource()
@@ -93,12 +112,14 @@ class Editor(QWidget):
                 "No class open", "Pick one from the sidebar.",
             )
             self.stack.setCurrentIndex(0)
+            # Still clear any leftover tabs/editors.
             self._sync_tabs([])
             return
 
         self.stack.setCurrentIndex(1)
         self._sync_tabs(r.open_class_tabs)
 
+        # Update text for the active tab.
         if r.active_class_full_name:
             idx = self._index_of(r.active_class_full_name)
             if idx >= 0:
@@ -107,9 +128,18 @@ class Editor(QWidget):
                 self.tabs.blockSignals(False)
             self._refresh_current_text()
 
+        # View bar reflects active view.
         self.view_bar.set_active(self.state.active_view)
 
     def _sync_tabs(self, open_names: list[str]) -> None:
+        """Make `self.tabs` mirror ``open_names``. Avoid rebuilding
+        every frame — only add/remove where needed so the user's
+        scroll position is preserved."""
+        current_names = []
+        for i in range(self.tabs.count()):
+            current_names.append(self.tabs.tabBar().tabData(i))
+
+        # Remove tabs that are no longer open.
         for i in reversed(range(self.tabs.count())):
             name = self.tabs.tabBar().tabData(i)
             if name not in open_names:
@@ -119,6 +149,7 @@ class Editor(QWidget):
                     self._editors.pop(name, None)
                 w.deleteLater()
 
+        # Add newly-opened tabs.
         present = set()
         for i in range(self.tabs.count()):
             present.add(self.tabs.tabBar().tabData(i))
@@ -138,6 +169,16 @@ class Editor(QWidget):
             self.tabs.tabBar().setTabData(idx, name)
             self.tabs.setTabToolTip(idx, name)
 
+            # Attach our own HiDPI-crisp close button to the tab's
+            # trailing (right-hand) side.
+            close_btn = _CloseButton(self.tabs.tabBar())
+            close_btn.clicked.connect(
+                lambda _checked=False, n=name: self.state.close_class_tab(n)
+            )
+            self.tabs.tabBar().setTabButton(
+                idx, QTabBar.ButtonPosition.RightSide, close_btn,
+            )
+
     def _refresh_current_text(self) -> None:
         r = self.state.active_resource()
         if r is None or not r.active_class_full_name:
@@ -155,10 +196,7 @@ class Editor(QWidget):
                 return i
         return -1
 
-    def _on_close(self, idx: int) -> None:
-        name = self.tabs.tabBar().tabData(idx)
-        if name:
-            self.state.close_class_tab(name)
+    # ── slots ────────────────────────────────────────────────────
 
     def _on_current_changed(self, idx: int) -> None:
         if idx < 0:
@@ -176,6 +214,89 @@ class Editor(QWidget):
     def _on_state_view_changed(self, _key: str) -> None:
         self.view_bar.set_active(self.state.active_view)
         self._refresh_current_text()
+
+    def _on_tab_context_menu(self, pos) -> None:
+        bar = self.tabs.tabBar()
+        idx = bar.tabAt(pos)
+        if idx < 0:
+            return
+        name = bar.tabData(idx)
+        if not name:
+            return
+
+        menu = QMenu(self)
+        act_close  = menu.addAction("Close")
+        act_others = menu.addAction("Close Others")
+        act_all    = menu.addAction("Close All")
+        menu.addSeparator()
+        act_copy   = menu.addAction("Copy Path")
+
+        act_others.setEnabled(self.tabs.count() > 1)
+        act_all.setEnabled(self.tabs.count() >= 1)
+
+        chosen = menu.exec(bar.mapToGlobal(pos))
+        if chosen is act_close:
+            self.state.close_class_tab(name)
+        elif chosen is act_others:
+            self.state.close_other_class_tabs(name)
+        elif chosen is act_all:
+            self.state.close_all_class_tabs()
+        elif chosen is act_copy:
+            from PySide6.QtGui import QGuiApplication
+            QGuiApplication.clipboard().setText(name)
+            self.state.set_status(f"Copied {name} to clipboard")
+
+
+# ── custom tab close button (HiDPI-crisp) ────────────────────────────────
+
+
+class _CloseButton(QAbstractButton):
+    """A 16×16 close button that draws its own × with antialiased
+    strokes. Scales perfectly on HiDPI where Qt's default close-tab
+    pixmap looks blurry."""
+
+    _ICON_SIZE = 16
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+        self.setFixedSize(self._ICON_SIZE, self._ICON_SIZE)
+        self.setToolTip("Close tab")
+        self.setFocusPolicy(Qt.NoFocus)
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._ICON_SIZE, self._ICON_SIZE)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # Rounded background on hover.
+        if self.underMouse():
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(Palette.bg_surface_2))
+            p.drawRoundedRect(self.rect(), 3, 3)
+            x_color = QColor(Palette.text_primary)
+        else:
+            x_color = QColor(Palette.text_muted)
+
+        pen = QPen(x_color, 1.5, Qt.SolidLine, Qt.RoundCap)
+        p.setPen(pen)
+
+        pad = 5
+        r = QRect(pad, pad,
+                  self.width() - pad * 2, self.height() - pad * 2)
+        p.drawLine(r.topLeft(), r.bottomRight())
+        p.drawLine(r.topRight(), r.bottomLeft())
+        p.end()
+
+    def enterEvent(self, event) -> None:
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.update()
+        super().leaveEvent(event)
 
 
 # ── bottom view bar ──────────────────────────────────────────────────────
@@ -218,20 +339,198 @@ class _ViewBar(QFrame):
 # ── code view ────────────────────────────────────────────────────────────
 
 
-class _CodeView(QPlainTextEdit):
+class _CodeView(QWidget):
+    """Composite widget: find bar on top, code editor below.
+
+    Find bar appears on Ctrl+F (Cmd+F on mac), hides on Esc. Search
+    uses Qt's native ``QTextDocument.find`` so case-insensitive /
+    wrap-around behaviour is handled natively.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._editor = _PlainCodeEditor(self)
+        self._find   = _FindBar(self._editor, self)
+        self._find.setVisible(False)
+
+        layout.addWidget(self._find)
+        layout.addWidget(self._editor, 1)
+
+        # Cross-platform standard shortcut (Ctrl+F / Cmd+F).
+        sc_find = QShortcut(QKeySequence.StandardKey.Find, self)
+        sc_find.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_find.activated.connect(self._find.show_and_focus)
+
+        sc_next = QShortcut(QKeySequence.StandardKey.FindNext, self)
+        sc_next.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_next.activated.connect(self._find.find_next)
+
+        sc_prev = QShortcut(QKeySequence.StandardKey.FindPrevious, self)
+        sc_prev.setContext(Qt.WidgetWithChildrenShortcut)
+        sc_prev.activated.connect(self._find.find_prev)
+
+    # ── API expected by the editor container ──────────────────────
+
+    def toPlainText(self) -> str:
+        return self._editor.toPlainText()
+
+    def set_text(self, text: str) -> None:
+        self._editor.setPlainText(text)
+        self._editor.verticalScrollBar().setValue(0)
+
+
+class _PlainCodeEditor(QPlainTextEdit):
+    """The text pane — same behaviour as before but now wrapped inside
+    ``_CodeView`` which owns the find bar."""
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("CodeEditor")
         self.setReadOnly(True)
         self.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.setFont(code_font())
-        self.setTabStopDistance(QFontMetrics(self.font()).horizontalAdvance(" ") * 4)
-
+        self.setTabStopDistance(
+            QFontMetrics(self.font()).horizontalAdvance(" ") * 4,
+        )
         self._highlighter = As3Highlighter(self.document())
 
-    def set_text(self, text: str) -> None:
-        self.setPlainText(text)
-        self.verticalScrollBar().setValue(0)
+
+class _FindBar(QFrame):
+    """Slim search strip that floats above the code editor.
+
+    Wire:
+    - text change -> live incremental search from cursor forward
+    - Enter        -> find next
+    - Shift+Enter  -> find previous
+    - Esc          -> close and return focus to editor
+    """
+
+    def __init__(
+        self,
+        editor: QPlainTextEdit,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._editor = editor
+        self.setObjectName("FindBar")
+        self.setFixedHeight(30)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+
+        self._input = QLineEdit(self)
+        self._input.setPlaceholderText("Find…")
+        self._input.textChanged.connect(self._on_text_changed)
+        self._input.returnPressed.connect(self.find_next)
+        layout.addWidget(self._input, 1)
+
+        self._status = QLabel("", self)
+        self._status.setStyleSheet(
+            f"color: {Palette.text_muted}; font-size: 11px;",
+        )
+        layout.addWidget(self._status)
+
+        prev = QToolButton(self)
+        prev.setText("↑")
+        prev.setCursor(QCursor(Qt.PointingHandCursor))
+        prev.setToolTip("Previous (Shift+Enter)")
+        prev.clicked.connect(self.find_prev)
+        layout.addWidget(prev)
+
+        nxt = QToolButton(self)
+        nxt.setText("↓")
+        nxt.setCursor(QCursor(Qt.PointingHandCursor))
+        nxt.setToolTip("Next (Enter)")
+        nxt.clicked.connect(self.find_next)
+        layout.addWidget(nxt)
+
+        close = _CloseButton(self)
+        close.setToolTip("Close Find (Esc)")
+        close.clicked.connect(self.hide_and_refocus)
+        layout.addWidget(close)
+
+        # Esc closes when focus is inside the find bar.
+        esc = QShortcut(QKeySequence("Esc"), self)
+        esc.setContext(Qt.WidgetWithChildrenShortcut)
+        esc.activated.connect(self.hide_and_refocus)
+
+        # Style: subtle top/bottom borders, surface colour.
+        self.setStyleSheet(
+            f"QFrame#FindBar {{"
+            f"  background: {Palette.bg_surface};"
+            f"  border-top: 1px solid {Palette.border};"
+            f"  border-bottom: 1px solid {Palette.border};"
+            f"}}"
+            f"QToolButton {{"
+            f"  background: transparent;"
+            f"  color: {Palette.text_muted};"
+            f"  border: none;"
+            f"  padding: 2px 8px;"
+            f"  border-radius: 4px;"
+            f"}}"
+            f"QToolButton:hover {{"
+            f"  background: {Palette.bg_surface_2};"
+            f"  color: {Palette.text_primary};"
+            f"}}",
+        )
+
+    # ── public slots ──────────────────────────────────────────────
+
+    def show_and_focus(self) -> None:
+        self.setVisible(True)
+        self._input.setFocus(Qt.ShortcutFocusReason)
+        self._input.selectAll()
+
+    def hide_and_refocus(self) -> None:
+        self.setVisible(False)
+        self._editor.setFocus(Qt.OtherFocusReason)
+
+    def find_next(self) -> None:
+        self._find(forward=True, from_cursor=True)
+
+    def find_prev(self) -> None:
+        self._find(forward=False, from_cursor=True)
+
+    # ── internals ────────────────────────────────────────────────
+
+    def _on_text_changed(self, _text: str) -> None:
+        # Incremental search: start from the current cursor's anchor
+        # so we don't keep jumping when the user edits the query.
+        cursor = self._editor.textCursor()
+        cursor.setPosition(cursor.selectionStart())
+        self._editor.setTextCursor(cursor)
+        self._find(forward=True, from_cursor=True)
+
+    def _find(self, *, forward: bool, from_cursor: bool) -> None:
+        needle = self._input.text()
+        if not needle:
+            self._status.setText("")
+            return
+
+        flags = QTextDocument.FindFlag(0)
+        if not forward:
+            flags |= QTextDocument.FindBackward
+
+        found = self._editor.find(needle, flags)
+        if not found:
+            # Wrap around.
+            cursor = self._editor.textCursor()
+            cursor.movePosition(
+                QTextCursor.End if not forward else QTextCursor.Start,
+            )
+            self._editor.setTextCursor(cursor)
+            found = self._editor.find(needle, flags)
+
+        if found:
+            self._status.setText("")
+        else:
+            self._status.setText("No results")
 
 
 # ── welcome page ─────────────────────────────────────────────────────────
