@@ -142,6 +142,9 @@ def stylesheet() -> str:
         background-color: {p.bg_surface_2};
         color: {p.text_primary};
     }}
+    QMenuBar::item:disabled {{
+        color: {p.text_disabled};
+    }}
     QMenu {{
         background-color: {p.bg_surface};
         color: {p.text_primary};
@@ -155,6 +158,17 @@ def stylesheet() -> str:
     }}
     QMenu::item:selected {{
         background-color: {p.bg_surface_2};
+    }}
+    /* Disabled entries — muted foreground, no hover highlight. The
+       :disabled selector must come after :selected so it wins on a
+       hovered-but-disabled row. */
+    QMenu::item:disabled {{
+        color: {p.text_disabled};
+        background: transparent;
+    }}
+    QMenu::item:disabled:selected {{
+        background: transparent;
+        color: {p.text_disabled};
     }}
     QMenu::separator {{
         height: 1px;
