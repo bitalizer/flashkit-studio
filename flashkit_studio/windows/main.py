@@ -417,7 +417,7 @@ class MainWindow(QMainWindow):
 class _AboutDialog(QDialog):
     """Modal info panel shown from Help → About."""
 
-    _REPO_URL = "https://github.com/bitalizer/flashkit"
+    _REPO_URL = "https://github.com/bitalizer/flashkit-studio"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -463,7 +463,7 @@ class _AboutDialog(QDialog):
 
         repo_link = QLabel(
             f'<a style="color:#5e9ce6; text-decoration:none;" '
-            f'href="{self._REPO_URL}">bitalizer/flashkit</a>',
+            f'href="{self._REPO_URL}">bitalizer/flashkit-studio</a>',
         )
         repo_link.setOpenExternalLinks(True)
         repo_link.setTextInteractionFlags(Qt.TextBrowserInteraction)
